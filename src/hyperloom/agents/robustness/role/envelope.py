@@ -112,6 +112,7 @@ CORE_STATE_FIELDS: frozenset[str] = frozenset(
         "model_class",
         "start_ts",
         "max_minutes",
+        "closing_grace_sec",
         "optimization_stack",
         "gain_per_stack_entry",
         "schema_version",

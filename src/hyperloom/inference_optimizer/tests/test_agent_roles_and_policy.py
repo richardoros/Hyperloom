@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
+from hyperloom.common.timeutil import iso_z
 from hyperloom.orchestrator.roles.agent_role import (
     BackendType,
     DEFAULT_CLAUDE_MODEL,
@@ -694,6 +697,29 @@ def test_gate_update_state_closing_phase_and_baseline_config_rejected(gate):
                 ),
             )
         assert exc.value.rule == "state_field", field_name
+
+
+def test_the_model_cannot_rewrite_the_budget_the_closing_reserve_leaves_it(gate):
+    """The reserve decides how much of ``max_minutes`` is spendable, so it is budget too."""
+    with pytest.raises(PolicyDenied) as exc:
+        gate.validate_intent(
+            "orchestration",
+            Intent(type=IntentType.UPDATE_STATE, payload={"changes": {"closing_grace_sec": 0.0}}),
+        )
+    assert exc.value.rule == "state_field"
+
+
+def test_a_forged_closing_reserve_would_have_spent_the_session_outright():
+    """Names what the lock prevents: one field, and the run has no usable time left."""
+    state = SharedState(session_id="s", max_minutes=100)
+    state.start_ts = iso_z(datetime.now(timezone.utc) - timedelta(minutes=90))
+    honest = state.session_budget_usable_sec()
+
+    applied = state.apply_changes({"closing_grace_sec": 1e9}, allow_core=False)
+
+    assert applied == {}
+    assert honest > 0.0
+    assert state.session_budget_usable_sec() == honest
 
 
 def test_core_state_fields_synced_with_robustness_envelope():
