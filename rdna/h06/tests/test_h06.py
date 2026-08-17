@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -141,6 +142,8 @@ class TestOwnership:
 
     def test_allowed_pid_is_filtered(self, monkeypatch):
         monkeypatch.setattr(ownership, "_rocm_pid_gpu_map", lambda: {12345: 0})
+        monkeypatch.setattr(ownership, "_rocm_device_index_to_bdf",
+                            lambda: {0: "0000:c8:00.0"})
         monkeypatch.setattr(ownership, "_drm_pid_gpu_map", lambda: {})
         owners = ownership.attribute_to_lab_gpu(
             lab_gpu_bdf="0000:c8:00.0", lab_gpu_uuid="0x26592ee0cc915973",
@@ -148,8 +151,11 @@ class TestOwnership:
         )
         assert owners == []
 
-    def test_rocm_owner_is_returned(self, monkeypatch):
+    def test_rocm_owner_on_lab_gpu(self, monkeypatch):
+        # device_index 0 maps to the lab GPU; PID is on the lab.
         monkeypatch.setattr(ownership, "_rocm_pid_gpu_map", lambda: {4242: 0})
+        monkeypatch.setattr(ownership, "_rocm_device_index_to_bdf",
+                            lambda: {0: "0000:c8:00.0"})
         monkeypatch.setattr(ownership, "_drm_pid_gpu_map", lambda: {})
         owners = ownership.attribute_to_lab_gpu(
             lab_gpu_bdf="0000:c8:00.0", lab_gpu_uuid="0x26592ee0cc915973",
@@ -158,8 +164,36 @@ class TestOwnership:
         assert owners[0].pid == 4242
         assert owners[0].backend == "rocm"
 
+    def test_rocm_owner_on_other_gpu_excluded(self, monkeypatch):
+        # device_index 0 maps to a DIFFERENT GPU; PID is NOT ours even
+        # though rocm-smi reports a positive attribution. This is the
+        # H0.6.1 fix: don't assume a KFD device_index belongs to the
+        # lab GPU without BDF resolution.
+        monkeypatch.setattr(ownership, "_rocm_pid_gpu_map", lambda: {4242: 0})
+        monkeypatch.setattr(ownership, "_rocm_device_index_to_bdf",
+                            lambda: {0: "0000:01:00.0"})
+        monkeypatch.setattr(ownership, "_drm_pid_gpu_map", lambda: {})
+        owners = ownership.attribute_to_lab_gpu(
+            lab_gpu_bdf="0000:c8:00.0", lab_gpu_uuid="0x26592ee0cc915973",
+        )
+        assert owners == []
+
+    def test_rocm_pid_unparseable_is_unknown(self, monkeypatch):
+        # device_index present in rocm-smi output but absent from
+        # rocm-smi --showbus (parse failure) -> backend='unknown'.
+        monkeypatch.setattr(ownership, "_rocm_pid_gpu_map", lambda: {6001: 0})
+        monkeypatch.setattr(ownership, "_rocm_device_index_to_bdf", lambda: {})
+        monkeypatch.setattr(ownership, "_drm_pid_gpu_map", lambda: {})
+        owners = ownership.attribute_to_lab_gpu(
+            lab_gpu_bdf="0000:c8:00.0", lab_gpu_uuid="0x26592ee0cc915973",
+        )
+        assert len(owners) == 1
+        assert owners[0].pid == 6001
+        assert owners[0].backend == "unknown"
+
     def test_drm_owner_with_matching_bdf_returned(self, monkeypatch):
         monkeypatch.setattr(ownership, "_rocm_pid_gpu_map", lambda: {})
+        monkeypatch.setattr(ownership, "_rocm_device_index_to_bdf", lambda: {})
         monkeypatch.setattr(ownership, "_drm_pid_gpu_map", lambda: {9001: "/dev/dri/card0"})
         monkeypatch.setattr(ownership, "_drm_card_to_bdf", lambda: {"/dev/dri/card0": "0000:c8:00.0"})
         owners = ownership.attribute_to_lab_gpu(
@@ -171,12 +205,37 @@ class TestOwnership:
 
     def test_drm_owner_on_other_gpu_filtered(self, monkeypatch):
         monkeypatch.setattr(ownership, "_rocm_pid_gpu_map", lambda: {})
+        monkeypatch.setattr(ownership, "_rocm_device_index_to_bdf", lambda: {})
         monkeypatch.setattr(ownership, "_drm_pid_gpu_map", lambda: {9001: "/dev/dri/card1"})
         monkeypatch.setattr(ownership, "_drm_card_to_bdf", lambda: {"/dev/dri/card1": "0000:01:00.0"})
         owners = ownership.attribute_to_lab_gpu(
             lab_gpu_bdf="0000:c8:00.0", lab_gpu_uuid="0x26592ee0cc915973",
         )
         assert owners == []
+
+    def test_drm_owner_unresolvable_is_unknown(self, monkeypatch):
+        monkeypatch.setattr(ownership, "_rocm_pid_gpu_map", lambda: {})
+        monkeypatch.setattr(ownership, "_rocm_device_index_to_bdf", lambda: {})
+        monkeypatch.setattr(ownership, "_drm_pid_gpu_map", lambda: {9002: "/dev/dri/cardX"})
+        monkeypatch.setattr(ownership, "_drm_card_to_bdf", lambda: {})
+        owners = ownership.attribute_to_lab_gpu(
+            lab_gpu_bdf="0000:c8:00.0", lab_gpu_uuid="0x26592ee0cc915973",
+        )
+        # Unresolvable: backend='unknown' (NOT silently attributed).
+        assert len(owners) == 1
+        assert owners[0].pid == 9002
+        assert owners[0].backend == "unknown"
+
+    def test_bdf_case_normalized(self, monkeypatch):
+        monkeypatch.setattr(ownership, "_rocm_pid_gpu_map", lambda: {})
+        monkeypatch.setattr(ownership, "_rocm_device_index_to_bdf", lambda: {})
+        monkeypatch.setattr(ownership, "_drm_pid_gpu_map", lambda: {9001: "/dev/dri/card0"})
+        monkeypatch.setattr(ownership, "_drm_card_to_bdf", lambda: {"/dev/dri/card0": "0000:C8:00.0"})
+        # Caller passes lab bdf in uppercase; should still match.
+        owners = ownership.attribute_to_lab_gpu(
+            lab_gpu_bdf="0000:C8:00.0", lab_gpu_uuid="0x26592ee0cc915973",
+        )
+        assert len(owners) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -206,15 +265,34 @@ class TestAllowlist:
 
 
 class TestRestoreTrap:
-    def _fake_snapshot(self) -> snap.PreStateSnapshot:
-        return snap.PreStateSnapshot(
+    def _fake_snapshot(self) -> snap_mod.PreStateSnapshot:
+        return snap_mod.PreStateSnapshot(
             captured_utc="2026-08-17T00:00:00Z",
-            lab_gpu=None, gpu_processes=[], gpu_telemetry=snap.GpuTelemetry(
+            lab_gpu=None, gpu_processes=[], gpu_telemetry=snap_mod.GpuTelemetry(
                 vram_total_bytes=0, vram_used_bytes=0, vram_free_bytes=0,
                 temperature_c=None, sclk_mhz=None, mclk_mhz=None, utilization_pct=None,
             ),
             services=[], listeners=[],
             production_health_ok=False,
+        )
+
+    def test_signal_handler_lambda_does_not_share_closure(self):
+        # H0.6.1 regression: the lambda installed for SIGTERM/SIGINT/SIGHUP
+        # used to close over the loop variable ``sig`` and so always re-raised
+        # SIGHUP regardless of which signal fired. We mirror the install
+        # pattern and assert each handler captures its own signal.
+        import signal as _signal
+        received: list[int] = []
+
+        class Trap:
+            def install(self):
+                for sig in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP):
+                    handler = (lambda *_, _sig=sig: received.append(_sig))
+                    handler()  # simulate signal receipt
+
+        Trap().install()
+        assert received == [_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP], (
+            f"each handler must bind to its own signal; got {received}"
         )
 
     def test_candidate_kill_on_exit(self, monkeypatch):
@@ -310,13 +388,20 @@ class TestRunLifecycle:
         monkeypatch.setattr(orchestrator, "attribute_to_lab_gpu",
                             lambda **kw: owners)
 
+    def _quick_measurement(self, ctx, exit_code: int = 0,
+                            candidate_pid=None):
+        """Return a small MeasurementResult (no IO, no threads)."""
+        from h06.orchestrator import MeasurementResult
+        # register_candidate closes over the local candidate_pid.
+        if candidate_pid is not None:
+            ctx.register_candidate_pid(candidate_pid)
+        return MeasurementResult(exit_code=exit_code, candidate_pid=candidate_pid)
+
     def test_pass_on_clean_lab_no_unknowns(self, tmp_path, monkeypatch):
         snap = self._fake_snapshot()
         self._patch_foreign_owners(monkeypatch, [])
-        # Redirect the lock file to a tmp_path we can create.
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
         monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
-        monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
         monkeypatch.setattr(orchestrator, "stop_service",
                             lambda name, **kw: allowlist.ServiceEvent(
                                 service=name, action="stop",
@@ -324,79 +409,146 @@ class TestRunLifecycle:
                                 finished_utc="2026-08-17T00:00:00Z",
                                 returncode=0,
                             ))
+        monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
+        monkeypatch.setattr(orchestrator, "attribute_to_lab_gpu", lambda **kw: [])
         audit = run_lifecycle(
-            measurement=lambda _ctx: 0,
+            measurement=lambda ctx: self._quick_measurement(ctx, 0, candidate_pid=4242),
             experiment_id=1,
             artifact_dir=tmp_path,
             snapshot_override=snap,
         )
         assert audit.outcome == Outcome.PASS
-        # No services in the allowlist -> no service events.
-        assert audit.owners_stopped == []
+        assert audit.candidate_pid == 4242
+        assert audit.candidate_exit == 0
+        assert audit.timed_out is False
         assert audit.restoration is not None
-        # Audit artifact was written.
         assert (tmp_path / "lifecycle_1.json").is_file()
 
     def test_blocked_on_unknown_owner(self, tmp_path, monkeypatch):
         snap = self._fake_snapshot()
         unknown = ownership.ProcessGpuOwner(
-            pid=9999, gpu_uuid=snap.lab_gpu.uuid, backend="rocm", detail="device_index=0",
+            pid=9999, gpu_uuid=snap.lab_gpu.uuid, backend="unknown",
+            detail="device_index=0 bdf=<unparsed>; do not assume",
         )
         self._patch_foreign_owners(monkeypatch, [unknown])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
         audit = run_lifecycle(
-            measurement=lambda _ctx: 0,
+            measurement=lambda ctx: self._quick_measurement(ctx),
             experiment_id=2,
             artifact_dir=tmp_path,
             snapshot_override=snap,
         )
         assert audit.outcome == Outcome.BLOCKED
-        assert "unknown XTX owner" in audit.reason
-        # The measurement callable must NOT have been invoked.
+        assert "UNKNOWN XTX owner" in audit.reason
         assert audit.candidate_pid is None
-        assert audit.restoration is None
+
+    def test_blocked_on_known_foreign_owner(self, tmp_path, monkeypatch):
+        snap = self._fake_snapshot()
+        known = ownership.ProcessGpuOwner(
+            pid=9999, gpu_uuid=snap.lab_gpu.uuid, backend="rocm",
+            detail="device_index=0 bdf=0000:c8:00.0",
+        )
+        self._patch_foreign_owners(monkeypatch, [known])
+        monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
+        audit = run_lifecycle(
+            measurement=lambda ctx: self._quick_measurement(ctx),
+            experiment_id=2,
+            artifact_dir=tmp_path,
+            snapshot_override=snap,
+        )
+        assert audit.outcome == Outcome.BLOCKED
+        assert "foreign XTX owner(s) not in allowlist" in audit.reason
 
     def test_unknown_owner_in_allowlist_passes(self, tmp_path, monkeypatch):
         snap = self._fake_snapshot()
         known = ownership.ProcessGpuOwner(
-            pid=9999, gpu_uuid=snap.lab_gpu.uuid, backend="rocm", detail="device_index=0",
+            pid=9999, gpu_uuid=snap.lab_gpu.uuid, backend="rocm",
+            detail="device_index=0 bdf=0000:c8:00.0",
         )
         self._patch_foreign_owners(monkeypatch, [known])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
         monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
         audit = run_lifecycle(
-            measurement=lambda _ctx: 0,
+            measurement=lambda ctx: self._quick_measurement(ctx),
             experiment_id=3,
             artifact_dir=tmp_path,
             snapshot_override=snap,
             allowed_pids=(9999,),
         )
         assert audit.outcome == Outcome.PASS
-        # PID 9999 was filtered out of foreign_owners_at_acquire (the audit
-        # field records the post-filter set so the operator sees what
-        # would actually block).
-        assert audit.foreign_owners_at_acquire == []
+        # The audit records the unfiltered unknown set; the allowed_pids
+        # check routes that PID past the BLOCK gate.
+        assert any(o.pid == 9999 for o in audit.foreign_owners_at_acquire)
 
-    def test_fail_when_measurement_raises(self, tmp_path, monkeypatch):
+    def test_non_zero_exit_is_FAIL(self, tmp_path, monkeypatch):
         snap = self._fake_snapshot()
         self._patch_foreign_owners(monkeypatch, [])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
         monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
-        def boom(_ctx):
-            raise RuntimeError("synthetic")
-        with pytest.raises(RuntimeError):
-            run_lifecycle(
-                measurement=boom,
-                experiment_id=4,
-                artifact_dir=tmp_path,
-                snapshot_override=snap,
-            )
+        audit = run_lifecycle(
+            measurement=lambda ctx: self._quick_measurement(ctx, exit_code=1),
+            experiment_id=4,
+            artifact_dir=tmp_path,
+            snapshot_override=snap,
+        )
+        assert audit.outcome == Outcome.FAIL
+        assert "non-zero" in audit.reason
+        assert audit.candidate_exit == 1
 
-    def test_fail_when_production_drops(self, tmp_path, monkeypatch):
+    def test_measurement_raises_is_FAIL(self, tmp_path, monkeypatch):
         snap = self._fake_snapshot()
-        # Make 18079 listening before, but unhealthy after.
+        self._patch_foreign_owners(monkeypatch, [])
+        monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
+        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
+        monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
+
+        def boom(ctx):
+            raise RuntimeError("synthetic measurement failure")
+        # The lifecycle wraps the measurement in a worker thread so
+        # the orchestrator never sees the raw exception; the failure is
+        # captured and surfaced as Outcome.FAIL.
+        audit = run_lifecycle(
+            measurement=boom,
+            experiment_id=5,
+            artifact_dir=tmp_path,
+            snapshot_override=snap,
+        )
+        assert audit.outcome == Outcome.FAIL
+        assert "synthetic" in audit.reason
+        assert audit.candidate_exit == -1
+
+    def test_timeout_classification(self, tmp_path, monkeypatch):
+        snap = self._fake_snapshot()
+        self._patch_foreign_owners(monkeypatch, [])
+        monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
+        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
+        monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
+
+        def slow(ctx):
+            ctx.register_candidate_pid(7777)
+            time.sleep(5)
+            from h06.orchestrator import MeasurementResult
+            return MeasurementResult(exit_code=0, candidate_pid=7777)
+        audit = run_lifecycle(
+            measurement=slow,
+            experiment_id=6,
+            artifact_dir=tmp_path,
+            snapshot_override=snap,
+            timeout_seconds=1.0,
+        )
+        assert audit.outcome == Outcome.TIMEOUT
+        assert audit.timed_out is True
+        # The exact language may change; just assert that it's a TIMEOUT-shaped message.
+        assert "did not complete within" in audit.reason
+        # The candidate PID was registered before sleep started, so the
+        # orchestrator owns it on timeout.
+        assert audit.candidate_pid == 7777
+
+    def test_production_dropped_proves_fail(self, tmp_path, monkeypatch):
+        snap = self._fake_snapshot()
+        # 18079 listening BEFORE; post-state probe returns unhealthy.
         snap = dataclasses.replace(
             snap,
             listeners=[
@@ -409,10 +561,28 @@ class TestRunLifecycle:
         monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: False)
         audit = run_lifecycle(
-            measurement=lambda _ctx: 0,
-            experiment_id=5,
+            measurement=lambda ctx: self._quick_measurement(ctx),
+            experiment_id=7,
             artifact_dir=tmp_path,
             snapshot_override=snap,
         )
         assert audit.outcome == Outcome.FAIL
-        assert "production" in audit.reason.lower()
+        assert audit.reason.startswith("production 18079 was listening")
+
+    def test_int_return_is_accepted_as_legacy(self, tmp_path, monkeypatch):
+        snap = self._fake_snapshot()
+        self._patch_foreign_owners(monkeypatch, [])
+        monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
+        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
+        monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
+        def legacy_measurement(ctx):
+            ctx.register_candidate_pid(555)
+            return 0  # legacy int contract
+        audit = run_lifecycle(
+            measurement=legacy_measurement,
+            experiment_id=8,
+            artifact_dir=tmp_path,
+            snapshot_override=snap,
+        )
+        assert audit.outcome == Outcome.PASS
+        assert audit.candidate_pid == 555

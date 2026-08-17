@@ -106,9 +106,14 @@ class RestoreTrap:
     def _install_signal_handlers(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             try:
-                self._previous_handlers[sig] = signal.signal(
-                    sig, lambda *_: self._restore_and_reraise(sig),
+                # H0.6.1 fix: bind ``sig`` as a default argument so the
+                # lambda closes over its own value, not the loop's
+                # final iteration. Without this, all three handlers
+                # re-raise SIGHUP regardless of which signal arrived.
+                handler = (
+                    lambda *_, _sig=sig: self._restore_and_reraise(_sig)
                 )
+                self._previous_handlers[sig] = signal.signal(sig, handler)
             except (ValueError, OSError):
                 # Signal handlers can only be installed from the main thread.
                 pass
