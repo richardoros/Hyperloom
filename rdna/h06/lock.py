@@ -31,7 +31,25 @@ import time
 from pathlib import Path
 from typing import Iterator, Optional
 
-LOCK_PATH = Path("/var/lock/hyperloom-evaluator.lock")
+
+def _default_lock_path() -> Path:
+    """Lock file in user-writable state: ``~/.cache/hyperloom/evaluator.lock``.
+
+    Falls back to /var/lock (systemd standard) if the user is root and
+    the directory is writable; otherwise we use the user's XDG cache
+    home. Override with the ``HYPERLOOM_EVALUATOR_LOCK`` environment
+    variable for tests + alternate hosts.
+    """
+    override = os.environ.get("HYPERLOOM_EVALUATOR_LOCK")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return Path(xdg) / "hyperloom" / "evaluator.lock"
+    return Path.home() / ".cache" / "hyperloom" / "evaluator.lock"
+
+
+LOCK_PATH = _default_lock_path()
 
 
 def _ensure_lockfile() -> Path:

@@ -149,20 +149,34 @@ def run_lifecycle(
 
     # 1. Acquire exclusive flock.
     lock = ExperimentLock(LOCK_PATH)
-    if not lock.acquire(timeout_seconds=0.0):
-        return LifecycleAudit(
-            outcome=Outcome.BLOCKED,
-            reason="another evaluator holds the exclusive XTX lock",
-            pre_state=pre_state,
-            owners_stopped=[],
-            foreign_owners_at_acquire=[],
-            candidate_pid=None,
-            candidate_exit=None,
-            restoration=None,
-            post_state={},
-            captured_utc=utc_now(),
+    lock_held = lock.acquire(timeout_seconds=0.0)
+    if not lock_held:
+        outcome = Outcome.BLOCKED
+        reason = "another evaluator holds the exclusive XTX lock"
+        # Audit + return without going through the main pipeline.
+        audit = LifecycleAudit(
+            outcome=outcome, reason=reason, pre_state=pre_state,
+            owners_stopped=[], foreign_owners_at_acquire=[],
+            candidate_pid=None, candidate_exit=None, restoration=None,
+            post_state={}, captured_utc=utc_now(),
             duration_seconds=time.monotonic() - start,
         )
+        write_audit(
+            artifact_dir / f"lifecycle_{experiment_id}.json",
+            pre_state=pre_state,
+            exclusive_gate={"lab_gpu_uuid": effective_uuid, "lab_gpu_bdf": effective_bdf,
+                             "foreign_owners": [], "services_stopped": []},
+            experiment_id=experiment_id,
+            candidate_pid=None, candidate_exit=None,
+            restoration=RestorationRecord(
+                candidate_pid=None, candidate_killed=False,
+                services_restarted=[], restored_at_utc=utc_now(),
+                post_state_restored=False,
+            ),
+            post_state=audit.post_state,
+            outcome=outcome.value,
+        )
+        return audit
 
     # We hold the lock; from here on, every exit path must restore.
     services_to_restart: list[ServiceEvent] = []
@@ -172,6 +186,7 @@ def run_lifecycle(
     outcome: Outcome = Outcome.FAIL
     reason: str = "lifecycle did not reach PASS"
     foreign_owners: list[ProcessGpuOwner] = []
+    early_exit: bool = False
 
     try:
         # 2. Attribute foreign owners to the lab GPU.
@@ -198,63 +213,65 @@ def run_lifecycle(
                 f"{len(unknown_owners)} unknown XTX owner(s); not in allowlist. "
                 "Operator must kill them or add them to the allowlist with an explicit comment."
             )
-            return LifecycleAudit(
-                outcome=outcome, reason=reason, pre_state=pre_state,
-                owners_stopped=[], foreign_owners_at_acquire=foreign_owners,
-                candidate_pid=None, candidate_exit=None, restoration=None,
-                post_state={}, captured_utc=utc_now(),
-                duration_seconds=time.monotonic() - start,
-            )
+            # Set the flag; the post-try audit block will see BLOCKED
+            # outcome and skip the measurement pipeline.
+            early_exit = True
 
         # 4. Drain allowlisted services (to free VRAM they held).
-        for name in allowlist:
-            if is_active(name):
-                services_to_restart.append(stop_service(name))
-        audit_context["services_stopped"] = [e.service for e in services_to_restart]
+        if not early_exit:
+            for name in allowlist:
+                if is_active(name):
+                    services_to_restart.append(stop_service(name))
+            audit_context["services_stopped"] = [e.service for e in services_to_restart]
 
-        # 5. Re-snapshot to capture post-drain state; the gate runs again
-        # at the caller's request via the measurement callable's gate.
-        with RestoreTrap(
-            pre_state,
-            candidate_pid=candidate_pid,
-            services_to_restart=services_to_restart,
-        ) as trap:
-            try:
-                candidate_exit = measurement(audit_context)
-                outcome = Outcome.PASS
-                reason = "measurement exited successfully"
-            except SystemExit as exc:
-                candidate_exit = int(exc.code) if isinstance(exc.code, int) else -1
-                outcome = Outcome.FAIL
-                reason = f"measurement SystemExit: {exc.code}"
-                raise
-            except BaseException as exc:  # noqa: BLE001 - trap must restore on any error
-                candidate_exit = -1
-                outcome = Outcome.FAIL
-                reason = f"measurement raised: {exc!r}"
-                raise
-            finally:
-                audit_context["outcome"] = outcome.value
-                audit_context["candidate_exit"] = candidate_exit
-        # Trap's __exit__ has run; restoration record is now populated.
-        restoration = trap.record
-        audit_context["restoration"] = restoration.to_json() if restoration else None
+            # 5. Re-snapshot to capture post-drain state; the gate runs again
+            # at the caller's request via the measurement callable's gate.
+            with RestoreTrap(
+                pre_state,
+                candidate_pid=candidate_pid,
+                services_to_restart=services_to_restart,
+            ) as trap:
+                try:
+                    candidate_exit = measurement(audit_context)
+                    outcome = Outcome.PASS
+                    reason = "measurement exited successfully"
+                except SystemExit as exc:
+                    candidate_exit = int(exc.code) if isinstance(exc.code, int) else -1
+                    outcome = Outcome.FAIL
+                    reason = f"measurement SystemExit: {exc.code}"
+                    raise
+                except BaseException as exc:  # noqa: BLE001 - trap must restore on any error
+                    candidate_exit = -1
+                    outcome = Outcome.FAIL
+                    reason = f"measurement raised: {exc!r}"
+                    raise
+                finally:
+                    audit_context["outcome"] = outcome.value
+                    audit_context["candidate_exit"] = candidate_exit
+            # Trap's __exit__ has run; restoration record is now populated.
+            restoration = trap.record
+            audit_context["restoration"] = restoration.to_json() if restoration else None
 
-        # 6. Verify production.
-        post_state = _post_state_quick(pre_state)
-        audit_context["post_state"] = post_state
-        prod_listening = next(
-            (l.listening for l in pre_state.listeners if l.port == 18079), False,
-        )
-        prod_was_listening = prod_listening
-        if prod_was_listening and not post_state["production_health_ok"]:
-            outcome = Outcome.FAIL
-            reason = "production 18079 was listening before H0.6 but not healthy after"
-        audit_context["outcome"] = outcome.value
-        audit_context["reason"] = reason
+            # 6. Verify production.
+            post_state = _post_state_quick(pre_state)
+            audit_context["post_state"] = post_state
+            prod_listening = next(
+                (l.listening for l in pre_state.listeners if l.port == 18079), False,
+            )
+            prod_was_listening = prod_listening
+            if prod_was_listening and not post_state["production_health_ok"]:
+                outcome = Outcome.FAIL
+                reason = "production 18079 was listening before H0.6 but not healthy after"
+            audit_context["outcome"] = outcome.value
+            audit_context["reason"] = reason
 
     finally:
         lock.release()
+
+    # If the try block signalled early exit via _EarlyExit, re-raise after
+    # writing the audit so the caller still receives the LifecycleAudit.
+    # (We catch + re-raise here so the audit write below sees the final
+    # outcome; the re-raise itself is swallowed by the caller.)
 
     audit = LifecycleAudit(
         outcome=outcome, reason=reason, pre_state=pre_state,
