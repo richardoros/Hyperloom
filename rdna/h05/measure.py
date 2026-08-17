@@ -212,10 +212,31 @@ def run_repeat(
     extra_envs: dict[str, str] | None = None,
     timeout_s: int = 900,
     work_root: Path,
+    identity_provider: "object | None" = None,
 ) -> AggregateResult:
-    """Run N independent measurements and aggregate."""
+    """Run N independent measurements and aggregate.
+
+    P1.6: the gate is invoked before EVERY repetition. A Celery job or
+    another llama-server can appear between repetitions and would
+    otherwise silently contaminate the variance baseline.
+    """
+    from .gate import gate as _gate
+
     measurements: list[Measurement] = []
     for i in range(repeat):
+        # Re-gate before every repetition.
+        if identity_provider is not None:
+            identity = identity_provider()
+            required = identity.model_size_bytes or 0
+            gate_report = _gate(
+                identity=identity,
+                exp_port=port,
+                required_bytes=required,
+            )
+            if not gate_report.ok:
+                raise RuntimeError(
+                    f"pre-repetition gate failed (iter {i}): {gate_report.reason}"
+                )
         per_run = work_root / f"run_{i:02d}"
         m = _run_one(
             model=model,

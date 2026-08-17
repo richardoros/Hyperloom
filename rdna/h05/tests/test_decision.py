@@ -29,13 +29,32 @@ class TestCompare:
         d = compare(baseline=b, candidate=c, metric="output_throughput", direction="higher")
         assert d.outcome == "INCONCLUSIVE"
 
-    def test_clear_promote(self):
+    def test_clear_promote_with_opt_in(self):
         # Baseline: 25 tok/s with 1.0 sd. Candidate: 27 tok/s (+8%, > 2σ + 3% floor).
         b = aggregate([_m(tg=t, e2el=4000.0) for t in (25.0, 25.5, 24.5, 25.0, 25.0)])
         c = aggregate([_m(tg=t, e2el=3800.0) for t in (27.0, 27.5, 26.5, 27.0, 27.0)])
+        # Default allow_promote=False: PROMOTE is gated, so the strongest
+        # claim becomes APPROVE.
+        d_default = compare(baseline=b, candidate=c, metric="output_throughput", direction="higher")
+        assert d_default.outcome == "APPROVE"
+        assert d_default.delta_pct > 0.07
+        # With explicit opt-in: PROMOTE is reachable (for the A/B/A gate path).
+        d_opt = compare(
+            baseline=b, candidate=c, metric="output_throughput",
+            direction="higher", allow_promote=True,
+        )
+        assert d_opt.outcome == "PROMOTE"
+        assert d_opt.delta_pct > 0.07
+
+    def test_promote_default_demoted_to_approve(self):
+        # A clean promote by the math (8% improvement, > sigma_floor) is
+        # demoted to APPROVE under the default allow_promote=False so the
+        # trust contract holds: PROMOTE is gated on A/B/A + product gate.
+        b = aggregate([_m(tg=t, e2el=4000.0) for t in (25.0, 25.5, 24.5, 25.0, 25.0)])
+        c = aggregate([_m(tg=t, e2el=3800.0) for t in (27.0, 27.5, 26.5, 27.0, 27.0)])
         d = compare(baseline=b, candidate=c, metric="output_throughput", direction="higher")
-        assert d.outcome == "PROMOTE"
-        assert d.delta_pct > 0.07
+        assert d.outcome == "APPROVE"
+        assert "PROMOTE gated" in d.reason
 
     def test_within_margin_approve(self):
         # Baseline: 25 tok/s. Candidate: 25.5 tok/s (+2%). Inside the
@@ -55,9 +74,16 @@ class TestCompare:
         # Lower e2el is better. baseline=5000ms, candidate=4500ms = -10% (improvement).
         b = aggregate([_m(tg=25.0, e2el=5000.0) for _ in range(5)])
         c = aggregate([_m(tg=25.0, e2el=4500.0) for _ in range(5)])
-        d = compare(baseline=b, candidate=c, metric="mean_e2el_ms", direction="lower")
-        assert d.outcome == "PROMOTE"
-        assert d.delta_pct > 0.09
+        # Default demoted to APPROVE.
+        d_default = compare(baseline=b, candidate=c, metric="mean_e2el_ms", direction="lower")
+        assert d_default.outcome == "APPROVE"
+        assert d_default.delta_pct > 0.09
+        # Opt-in: PROMOTE.
+        d_opt = compare(
+            baseline=b, candidate=c, metric="mean_e2el_ms",
+            direction="lower", allow_promote=True,
+        )
+        assert d_opt.outcome == "PROMOTE"
 
     def test_regression_with_lower_direction(self):
         # baseline=4500ms, candidate=5000ms = +10% (regression in lower-is-better).
@@ -66,6 +92,20 @@ class TestCompare:
         d = compare(baseline=b, candidate=c, metric="mean_e2el_ms", direction="lower")
         assert d.outcome == "RETAIN"
         assert d.delta_pct < 0
+
+    def test_sigma_floor_is_positive_for_lower_metrics(self):
+        # P0.3: _sigma_floor_pct must be a positive percent for both
+        # higher and lower metrics so max(sigma_floor, promote_floor)
+        # correctly takes the larger of the two.
+        from rdna.h05.decision import _sigma_floor_pct
+        vals = [4500.0, 4510.0, 4490.0, 4505.0, 4495.0]
+        sigma = _sigma_floor_pct(vals, direction="lower")
+        assert sigma > 0
+        # 2*sd/median in percent:
+        import statistics
+        sd = statistics.stdev(vals)
+        median = statistics.median(vals)
+        assert sigma == pytest.approx(abs((2 * sd) / median))
 
 
 class TestCompareABA:

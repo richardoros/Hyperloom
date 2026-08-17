@@ -138,14 +138,41 @@ def _persist(result_file: str, payload: dict) -> None:
         json.dump(payload, fh, indent=2)
 
 
-def run_completion(port: int, model: str, result_file: str) -> int:
-    """Drive one ~4K-token completion, persist ``inferencex_result.json``, gate."""
-    unit = "The quick brown fox jumps over the lazy dog while the wise owl watches from the oak tree. "
-    prompt = (unit * 200)[:16000]
+def run_completion(
+    port: int,
+    model: str,
+    result_file: str,
+    *,
+    fixture: dict | None = None,
+) -> int:
+    """Drive one completion, persist ``inferencex_result.json``, gate.
+
+    P1.10: ``fixture`` is an exact-token workload spec (prompt string +
+    n_predict + seed + temperature). The bench script sends this exact
+    payload to llama-server so re-runs on the same GGUF produce the
+    same token sequence after tokenization. The fixture itself is
+    hashed (see ``fixture_hash``) and recorded in the result payload so
+    audit replays can verify which workload was used.
+
+    Pinned to a 4K-character prompt and 128 n_predict by default. The
+    prompt string is fixed; combined with the GGUF tokenizer it produces
+    a deterministic token sequence per GGUF. Bench scripts may override
+    by passing ``fixture=...``.
+    """
+    if fixture is None:
+        fixture = DEFAULT_FIXTURE
+    fixture_hash = hashlib.sha256(
+        json.dumps(fixture, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    prompt = fixture["prompt"]
+    n_predict = int(fixture.get("n_predict", 128))
+    seed = int(fixture.get("seed", 0))
+    temperature = float(fixture.get("temperature", 0.0))
     req = {
         "prompt": prompt,
-        "n_predict": 128,
-        "temperature": 0.0,
+        "n_predict": n_predict,
+        "temperature": temperature,
+        "seed": seed,
         "cache_prompt": False,
     }
     start = time.monotonic()
@@ -165,16 +192,39 @@ def run_completion(port: int, model: str, result_file: str) -> int:
     wall = time.monotonic() - start
     timings = parse_timings(body.get("timings", {}))
     quality_ok = bool(body.get("content")) and timings["eval_n"] > 0
-    _persist(result_file, build_result(model, wall, timings, quality_ok, body.get("context_size") or 0))
+    payload = build_result(model, wall, timings, quality_ok, body.get("context_size") or 0)
+    # Audit fields: prove which exact-token workload produced these numbers.
+    payload["fixture_hash"] = fixture_hash
+    payload["fixture_n_predict"] = n_predict
+    payload["fixture_seed"] = seed
+    payload["fixture_temperature"] = temperature
+    payload["fixture_prompt_chars"] = len(prompt)
+    _persist(result_file, payload)
     if not quality_ok:
         print("BENCH_FAIL: empty completion or zero eval tokens", file=sys.stderr)
         return 1
     print(
         f"pp={timings['pp_tok_s']:.1f} tok/s tg={timings['tg_tok_s']:.1f} tok/s "
         f"prompt_eval={timings['prompt_ms']:.0f} ms prompt_n={timings['prompt_n']} "
-        f"eval_n={timings['eval_n']} wall={wall:.1f}s"
+        f"eval_n={timings['eval_n']} wall={wall:.1f}s "
+        f"fixture={fixture_hash[:12]}"
     )
     return 0
+
+
+#: Default exact-token fixture. The prompt is a fixed string; combined
+#: with the GGUF tokenizer and the seed it produces a deterministic
+#: token sequence for a given GGUF. Bench scripts may override by
+#: passing ``fixture=...`` to ``run_completion``.
+DEFAULT_FIXTURE: dict = {
+    "prompt": (
+        "The quick brown fox jumps over the lazy dog while the wise owl watches from "
+        "the oak tree. "
+    ) * 200,
+    "n_predict": 128,
+    "seed": 0,
+    "temperature": 0.0,
+}
 
 
 def _usage(prog: str) -> None:

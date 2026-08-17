@@ -59,17 +59,57 @@ class TestExperimentDB:
             assert row["identity_hash"] == ib.identity_hash
             assert json.loads(row["identity_json"])["source_sha"] == "sha1"
 
-    def test_record_run_unique_on_iteration(self, tmp_path: Path):
+    def test_record_run_appends_per_variant(self, tmp_path: Path):
+        """Two runs with the same (experiment, variant, iteration) is a
+        HARD ERROR: evidence must not be silently overwritten."""
+        import sqlite3
         db_path = tmp_path / "experiments.db"
+        ib = _identity(2)
         with ExperimentDB(db_path) as db:
-            ib = _identity(2)
             eid = db.open_experiment(label="exp2", identity=ib)
-            db.record_run(eid, iteration=0, gate_json="{}", measurement_json=json.dumps(_measurement(25.0).to_dict()), success=True)
-            # Re-record the same iteration should overwrite, not error.
-            db.record_run(eid, iteration=0, gate_json="{}", measurement_json=json.dumps(_measurement(27.0).to_dict()), success=True)
+            db.record_run(
+                eid, variant="baseline", iteration=0,
+                identity=ib, gate_json="{}",
+                measurement_json=json.dumps(_measurement(25.0).to_dict()),
+                success=True,
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                db.record_run(
+                    eid, variant="baseline", iteration=0,
+                    identity=ib, gate_json="{}",
+                    measurement_json=json.dumps(_measurement(27.0).to_dict()),
+                    success=True,
+                )
+            # Different variant at the same iteration is allowed.
+            db.record_run(
+                eid, variant="candidate", iteration=0,
+                identity=ib, gate_json="{}",
+                measurement_json=json.dumps(_measurement(27.0).to_dict()),
+                success=True,
+            )
             runs = db.experiment_runs(eid)
-            assert len(runs) == 1
-            assert json.loads(runs[0]["measurement_json"])["output_throughput"] == 27.0
+            assert len(runs) == 2
+
+    def test_per_run_identity_persisted(self, tmp_path: Path):
+        """Each run row carries its own identity; the experiment identity
+        is the baseline identity only."""
+        db_path = tmp_path / "experiments.db"
+        ib_baseline = _identity(10)
+        ib_candidate = _identity(11)
+        ib_candidate = dataclasses.replace(ib_candidate, binary_sha256="z" * 64)  # noqa: F821
+        with ExperimentDB(db_path) as db:
+            eid = db.open_experiment(label="exp_per_run", identity=ib_baseline)
+            db.record_run(eid, variant="baseline", iteration=0, identity=ib_baseline,
+                          gate_json="{}", measurement_json="{}", success=True)
+            db.record_run(eid, variant="candidate", iteration=0, identity=ib_candidate,
+                          gate_json="{}", measurement_json="{}", success=True)
+            runs = db.experiment_runs(eid)
+            assert len(runs) == 2
+            baseline_run = next(r for r in runs if r["variant"] == "baseline")
+            candidate_run = next(r for r in runs if r["variant"] == "candidate")
+            assert baseline_run["identity_hash"] == ib_baseline.identity_hash
+            assert candidate_run["identity_hash"] == ib_candidate.identity_hash
+            assert baseline_run["identity_hash"] != candidate_run["identity_hash"]
 
     def test_record_decision(self, tmp_path: Path):
         db_path = tmp_path / "experiments.db"

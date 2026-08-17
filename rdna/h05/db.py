@@ -29,7 +29,7 @@ from .identity import IdentityBlock
 from .measure import AggregateResult
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Decision(str, enum.Enum):
@@ -57,15 +57,23 @@ CREATE TABLE IF NOT EXISTS experiments (
     created_utc     TEXT NOT NULL,
     closed_utc      TEXT
 );
+-- Runs are append-only within a (experiment_id, variant, iteration)
+-- UNIQUE constraint. Re-recording the same iteration is a HARD ERROR so
+-- evidence (failed attempts, blocked gates, repeated tries) is preserved
+-- rather than silently overwritten. To restart an experiment, the
+-- operator opens a new label.
 CREATE TABLE IF NOT EXISTS runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     experiment_id   INTEGER NOT NULL REFERENCES experiments(id),
+    variant         TEXT NOT NULL DEFAULT 'baseline',
     iteration       INTEGER NOT NULL,
+    identity_json   TEXT NOT NULL,
+    identity_hash   TEXT NOT NULL,
     gate_json       TEXT NOT NULL,
     measurement_json TEXT NOT NULL,
     success         INTEGER NOT NULL,
     created_utc     TEXT NOT NULL,
-    UNIQUE(experiment_id, iteration)
+    UNIQUE(experiment_id, variant, iteration)
 );
 CREATE TABLE IF NOT EXISTS decisions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,6 +85,7 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_experiments_hash ON experiments(identity_hash);
 CREATE INDEX IF NOT EXISTS idx_runs_experiment  ON runs(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_runs_variant    ON runs(experiment_id, variant, iteration);
 CREATE INDEX IF NOT EXISTS idx_decisions_experiment ON decisions(experiment_id);
 """
 
@@ -152,20 +161,30 @@ class ExperimentDB:
         self,
         experiment_id: int,
         *,
+        variant: str,
         iteration: int,
+        identity: IdentityBlock,
         gate_json: str,
         measurement_json: str,
         success: bool,
     ) -> int:
+        """Append a single run row.
+
+        ``(experiment_id, variant, iteration)`` is UNIQUE; a conflict is a
+        HARD ERROR so evidence (failed attempts, blocked gates, repeated
+        tries) is preserved rather than overwritten. To restart, open a
+        new experiment label.
+        """
         cur = self._conn.execute(
-            "INSERT INTO runs(experiment_id, iteration, gate_json, measurement_json, success, created_utc) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(experiment_id, iteration) DO UPDATE SET "
-            "gate_json = excluded.gate_json, measurement_json = excluded.measurement_json, "
-            "success = excluded.success, created_utc = excluded.created_utc",
+            "INSERT INTO runs(experiment_id, variant, iteration, identity_json, "
+            "identity_hash, gate_json, measurement_json, success, created_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 experiment_id,
+                variant,
                 iteration,
+                identity.to_json(),
+                identity.identity_hash,
                 gate_json,
                 measurement_json,
                 1 if success else 0,
@@ -188,9 +207,19 @@ class ExperimentDB:
             "SELECT * FROM experiments WHERE id = ?", (experiment_id,)
         ).fetchone()
 
-    def experiment_runs(self, experiment_id: int) -> list[sqlite3.Row]:
+    def experiment_runs(self, experiment_id: int, variant: str | None = None) -> list[sqlite3.Row]:
+        """Return runs for one experiment, ordered by (variant, iteration).
+
+        If ``variant`` is None, all variants are returned (useful for show).
+        """
+        if variant is None:
+            return self._conn.execute(
+                "SELECT iteration, variant, identity_hash, gate_json, measurement_json, success, created_utc "
+                "FROM runs WHERE experiment_id = ? ORDER BY variant, iteration",
+                (experiment_id,),
+            ).fetchall()
         return self._conn.execute(
-            "SELECT iteration, gate_json, measurement_json, success, created_utc "
-            "FROM runs WHERE experiment_id = ? ORDER BY iteration",
-            (experiment_id,),
+            "SELECT iteration, variant, identity_hash, gate_json, measurement_json, success, created_utc "
+            "FROM runs WHERE experiment_id = ? AND variant = ? ORDER BY iteration",
+            (experiment_id, variant),
         ).fetchall()
