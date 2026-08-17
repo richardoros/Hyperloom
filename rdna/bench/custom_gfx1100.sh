@@ -147,13 +147,14 @@ except Exception as exc:  # noqa: BLE001 - fail-closed gate
 
 wall = time.monotonic() - start
 t = body.get("timings", {})
-prompt_n = int(t.get("prompt_eval_count") or 0)
-prompt_ms = (t.get("prompt_eval_duration") or 0) / 1e6
-eval_n = int(t.get("eval_count") or 0)
-eval_ms = (t.get("eval_duration") or 0) / 1e6
-pp_tok_s = (prompt_n / prompt_ms * 1000.0) if prompt_ms > 0 else 0.0
-tg_tok_s = (eval_n / eval_ms * 1000.0) if eval_ms > 0 else 0.0
-ttft_ms = (t.get("prompt_perceived_ms") or 0.0) or (t.get("prompt_ms") or 0.0)
+# buun-llama-cpp fork key names; upstream llama.cpp equivalents as fallback.
+prompt_n = int(t.get("prompt_n") or t.get("prompt_eval_count") or 0)
+prompt_ms = (t.get("prompt_ms") or (t.get("prompt_eval_duration") or 0) / 1e6) or 0.0
+eval_n = int(t.get("predicted_n") or t.get("eval_count") or 0)
+eval_ms = (t.get("predicted_ms") or (t.get("eval_duration") or 0) / 1e6) or 0.0
+pp_tok_s = float(t.get("prompt_per_second") or (prompt_n / prompt_ms * 1000.0 if prompt_ms > 0 else 0.0))
+tg_tok_s = float(t.get("predicted_per_second") or (eval_n / eval_ms * 1000.0 if eval_ms > 0 else 0.0))
+ttft_ms = float(prompt_ms or 0.0)
 quality_ok = bool(body.get("content")) and eval_n > 0
 
 payload = {
@@ -174,6 +175,8 @@ payload = {
     "mean_tpot_ms": round(eval_ms / eval_n, 3) if eval_n else None,
     "mean_e2el_ms": round(eval_ms, 3),
     "prompt_eval_tok_s": round(pp_tok_s, 3),
+    "draft_n": int(t.get("draft_n") or 0),
+    "draft_n_accepted": int(t.get("draft_n_accepted") or 0),
     "context_size": int(body.get("context_size") or 0),
 }
 with open(result_file, "w", encoding="utf-8") as fh:
