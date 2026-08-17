@@ -31,20 +31,22 @@ class TestCompare:
 
     def test_clear_promote_with_opt_in(self):
         # Baseline: 25 tok/s with 1.0 sd. Candidate: 27 tok/s (+8%, > 2σ + 3% floor).
+        # PROMOTE is structurally gated until the product-quality gate
+        # exists, so allow_promote=True still demotes to APPROVE.
         b = aggregate([_m(tg=t, e2el=4000.0) for t in (25.0, 25.5, 24.5, 25.0, 25.0)])
         c = aggregate([_m(tg=t, e2el=3800.0) for t in (27.0, 27.5, 26.5, 27.0, 27.0)])
-        # Default allow_promote=False: PROMOTE is gated, so the strongest
-        # claim becomes APPROVE.
         d_default = compare(baseline=b, candidate=c, metric="output_throughput", direction="higher")
         assert d_default.outcome == "APPROVE"
         assert d_default.delta_pct > 0.07
-        # With explicit opt-in: PROMOTE is reachable (for the A/B/A gate path).
+        # allow_promote=True no longer unlocks PROMOTE; that contract
+        # belongs to a future product-quality gate. Today the strongest
+        # claim is APPROVE.
         d_opt = compare(
             baseline=b, candidate=c, metric="output_throughput",
             direction="higher", allow_promote=True,
         )
-        assert d_opt.outcome == "PROMOTE"
-        assert d_opt.delta_pct > 0.07
+        assert d_opt.outcome == "APPROVE"
+        assert "PROMOTE gated" in d_opt.reason
 
     def test_promote_default_demoted_to_approve(self):
         # A clean promote by the math (8% improvement, > sigma_floor) is
@@ -78,12 +80,13 @@ class TestCompare:
         d_default = compare(baseline=b, candidate=c, metric="mean_e2el_ms", direction="lower")
         assert d_default.outcome == "APPROVE"
         assert d_default.delta_pct > 0.09
-        # Opt-in: PROMOTE.
+        # Opt-in still gates PROMOTE on product-quality gate.
         d_opt = compare(
             baseline=b, candidate=c, metric="mean_e2el_ms",
             direction="lower", allow_promote=True,
         )
-        assert d_opt.outcome == "PROMOTE"
+        assert d_opt.outcome == "APPROVE"
+        assert "PROMOTE gated" in d_opt.reason
 
     def test_regression_with_lower_direction(self):
         # baseline=4500ms, candidate=5000ms = +10% (regression in lower-is-better).
@@ -110,20 +113,45 @@ class TestCompare:
 
 class TestCompareABA:
     def test_promote_holds_in_follow_up(self):
+        # PROMOTE is structurally unreachable until the product-quality
+        # gate exists. A clean A/B/A confirms the candidate but the
+        # outcome is APPROVE, not PROMOTE.
         b1 = aggregate([_m(tg=t, e2el=4000.0) for t in (25.0,) * 5])
         c = aggregate([_m(tg=t, e2el=3800.0) for t in (27.0,) * 5])
         b2 = aggregate([_m(tg=t, e2el=4000.0) for t in (25.0,) * 5])
         d = compare_aba(baseline=b1, candidate=c, follow_up=b2, metric="output_throughput")
-        assert d.outcome == "PROMOTE"
-        assert "A/B/A confirmed" in d.reason
+        assert d.outcome == "APPROVE"
+        assert "A/B/A passed" in d.reason
+        assert "product-quality gate" in d.reason
 
-    def test_promote_fails_when_follow_up_regresses(self):
+    def test_promote_demoted_when_follow_up_regresses(self):
         b1 = aggregate([_m(tg=t, e2el=4000.0) for t in (25.0,) * 5])
         c = aggregate([_m(tg=t, e2el=3800.0) for t in (27.0,) * 5])
         b2 = aggregate([_m(tg=t, e2el=4000.0) for t in (26.5,) * 5])  # follow-up re-measured 26.5
         d = compare_aba(baseline=b1, candidate=c, follow_up=b2, metric="output_throughput")
-        assert d.outcome == "RETAIN"
+        assert d.outcome == "APPROVE"
         assert "A/B/A failed" in d.reason
+
+    def test_promote_unreachable_from_any_path(self):
+        """No code path in this module may emit PROMOTE today."""
+        from rdna.h05.decision import compare, compare_aba
+        # Path 1: clean promote with allow_promote=True
+        b = aggregate([_m(tg=t, e2el=4000.0) for t in (25.0, 25.5, 24.5, 25.0, 25.0)])
+        c = aggregate([_m(tg=t, e2el=3800.0) for t in (27.0, 27.5, 26.5, 27.0, 27.0)])
+        d_opt = compare(
+            baseline=b, candidate=c, metric="output_throughput",
+            direction="higher", allow_promote=True,
+        )
+        assert d_opt.outcome != "PROMOTE", (
+            f"compare(allow_promote=True) emitted {d_opt.outcome}; PROMOTE is "
+            "structurally gated until product-quality gate exists"
+        )
+        # Path 2: A/B/A confirmation
+        b2 = aggregate([_m(tg=t, e2el=4000.0) for t in (25.0,) * 5])
+        d_aba = compare_aba(baseline=b, candidate=c, follow_up=b2, metric="output_throughput")
+        assert d_aba.outcome != "PROMOTE", (
+            f"compare_aba emitted {d_aba.outcome}; PROMOTE is structurally gated"
+        )
 
     def test_non_promote_does_not_run_aba(self):
         b1 = aggregate([_m(tg=25.0, e2el=4000.0) for _ in range(5)])

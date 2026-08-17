@@ -85,27 +85,27 @@ def compare(
     direction: Direction = "higher",
     promote_floor_pct: float = 0.03,
     approve_margin_pct: float = 0.01,
-    allow_promote: bool = False,
+    allow_promote: bool = False,  # noqa: ARG001 - accepted but unused
 ) -> Decision:
     """Compare baseline vs candidate on one metric.
 
     Decision thresholds:
-      - PROMOTE: improvement > max(2σ of baseline, +promote_floor_pct)
-      - APPROVE: improvement > +approve_margin_pct AND <= promote_floor
+      - PROMOTE: NOT EMITTABLE from this function. PROMOTE requires both
+        A/B/A interleaving confirmation AND a product-quality gate
+        ("correct work per wall-hour" that outranks raw tok/s); neither
+        exists today. When both land, ``compare`` becomes the inner
+        check and a product-gated wrapper promotes to PROMOTE. Until
+        then the strongest claim from this function is APPROVE.
+      - APPROVE: improvement > +approve_margin_pct
       - RETAIN:  otherwise (no improvement, or candidate regressed)
       - INCONCLUSIVE: empty samples on either side (caller must re-run)
 
-    ``allow_promote`` defaults to False. PROMOTE is the strongest claim
-    the evaluator can make ("this candidate is genuinely better than the
-    baseline") and must be gated by:
-      (a) the A/B/A interleaving confirmation that the improvement is
-          not a transient drift; and
-      (b) a product-quality gate (correct work per wall-hour) that
-          outranks raw tok/s.
-    Neither of those is implemented yet; callers must explicitly opt in
-    by passing ``allow_promote=True``. The CLI's ``decide`` command does
-    NOT pass it, so the maximum outcome today is APPROVE / RETAIN.
+    The ``allow_promote`` parameter is retained for forward
+    compatibility but is currently a no-op: passing it does NOT unlock
+    PROMOTE. The trust-critical contract is: no code path in this
+    module currently emits PROMOTE.
     """
+    _ = allow_promote  # intentionally unused; PROMOTE gated on A/B/A + product gate
     b_vals = [float(getattr(m, metric)) for m in baseline.measurements]
     c_vals = [float(getattr(m, metric)) for m in candidate.measurements]
     if not b_vals or not c_vals:
@@ -122,13 +122,15 @@ def compare(
     delta = _delta_pct(b_med, c_med, direction=direction)
     sigma_floor = max(_sigma_floor_pct(b_vals, direction), promote_floor_pct)
 
-    if delta > sigma_floor and allow_promote:
+    if delta > sigma_floor:
+        # Would have been PROMOTE under the old contract. Demote to
+        # APPROVE until A/B/A + product-quality gate exist.
         return Decision(
-            outcome="PROMOTE",
+            outcome="APPROVE",
             reason=(
                 f"{metric}: candidate {c_med:.3f} beats baseline {b_med:.3f} "
                 f"by {delta:.3%} (> sigma_floor {sigma_floor:.3%}); "
-                "allow_promote=True"
+                "PROMOTE gated on A/B/A + product-quality gate (not yet wired)"
             ),
             baseline_median=b_med,
             candidate_median=c_med,
@@ -136,18 +138,12 @@ def compare(
             sigma_floor_pct=sigma_floor,
         )
     if delta > approve_margin_pct:
-        # Improvement is real but inside the promote floor, OR the caller
-        # has not opted in to PROMOTE (the default). Demote to APPROVE.
-        reason = (
-            f"{metric}: candidate {c_med:.3f} beats baseline {b_med:.3f} "
-            f"by {delta:.3%} (sigma_floor {sigma_floor:.3%}"
-        )
-        if not allow_promote:
-            reason += "; PROMOTE gated on A/B/A + product-quality gate (not yet wired)"
-        reason += ")"
         return Decision(
             outcome="APPROVE",
-            reason=reason,
+            reason=(
+                f"{metric}: candidate {c_med:.3f} beats baseline {b_med:.3f} "
+                f"by {delta:.3%} (within {promote_floor_pct:.1%} promote floor)"
+            ),
             baseline_median=b_med,
             candidate_median=c_med,
             delta_pct=delta,
@@ -173,50 +169,68 @@ def compare_aba(
     follow_up: AggregateResult,
     metric: str,
     direction: Direction = "higher",
+    promote_floor_pct: float = 0.03,
 ) -> Decision:
     """A/B/A: confirm the candidate's improvement holds under a fresh
-    re-measurement. A PROMOTE only sticks if the candidate's median also
-    beats the follow-up baseline within the same margin. Used as the
-    gate before any candidate becomes a new HEAD build.
+    re-measurement.
 
-    Because A/B/A IS the promote gate, ``compare_aba`` always passes
-    ``allow_promote=True`` to its inner ``compare`` calls. The CLI's
-    plain ``compare`` path still defaults to ``allow_promote=False``.
+    Trust-critical note: until a *product-quality gate* exists (a
+    measurement of "correct work per wall-hour" that outranks raw
+    tok/s), PROMOTE is structurally unreachable from any code path in
+    this module. A/B/A is a NECESSARY gate; it is not a SUFFICIENT
+    one. When the product-quality gate lands, it should be composed
+    with this check by the caller.
+
+    A/B/A decision:
+      - PRIMARY A/B below promote floor  → RETAIN (no real improvement)
+      - PRIMARY passes, FOLLOW-UP does not also beat the promote floor
+        → APPROVE (A/B/A failed; primary delta alone is not enough)
+      - PRIMARY passes, FOLLOW-UP also passes  → APPROVE with
+        "A/B/A passed" annotation (PROMOTE still gated on product gate)
     """
     primary = compare(
         baseline=baseline,
         candidate=candidate,
         metric=metric,
         direction=direction,
-        allow_promote=True,
+        promote_floor_pct=promote_floor_pct,
     )
-    if primary.outcome != "PROMOTE":
+    if primary.outcome == "RETAIN" or primary.outcome == "INCONCLUSIVE":
         return primary
     follow_up_cmp = compare(
         baseline=follow_up,
         candidate=candidate,
         metric=metric,
         direction=direction,
-        allow_promote=True,
+        promote_floor_pct=promote_floor_pct,
     )
-    if follow_up_cmp.outcome == "PROMOTE":
+    # A/B/A "fails" when the follow-up does not meet the promote floor.
+    # The follow-up's own APPROVE/RETAIN status alone isn't enough —
+    # APPROVE may mean "inside the promote floor" (which is the
+    # failure mode for A/B/A here).
+    if follow_up_cmp.delta_pct < promote_floor_pct:
         return Decision(
-            outcome="PROMOTE",
+            outcome="APPROVE",
             reason=(
                 primary.reason
-                + " | A/B/A confirmed: candidate also beats follow-up "
-                f"baseline ({follow_up_cmp.delta_pct:.3%} delta)"
+                + f" | A/B/A failed: follow-up delta {follow_up_cmp.delta_pct:.3%} "
+                f"< promote_floor {promote_floor_pct:.3%}; PROMOTE still gated "
+                "on product-quality gate"
             ),
             baseline_median=primary.baseline_median,
             candidate_median=primary.candidate_median,
             delta_pct=primary.delta_pct,
             sigma_floor_pct=primary.sigma_floor_pct,
         )
+    # Both A/B and A/B/A passed. PROMOTE still requires product-quality
+    # gate, which does not exist yet; demote to APPROVE so the result
+    # is observable but not over-claimed.
     return Decision(
-        outcome="RETAIN",
+        outcome="APPROVE",
         reason=(
             primary.reason
-            + f" | A/B/A failed: follow-up delta only {follow_up_cmp.delta_pct:.3%}"
+            + " | A/B/A passed; PROMOTE gated on product-quality "
+            "gate (not yet implemented)"
         ),
         baseline_median=primary.baseline_median,
         candidate_median=primary.candidate_median,

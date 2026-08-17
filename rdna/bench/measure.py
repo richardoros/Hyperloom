@@ -23,12 +23,14 @@ above are what the unit tests exercise.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 import socket
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
 FRAMEWORK = "custom"
 WORKLOAD_KIND = "scriptable"
@@ -144,32 +146,65 @@ def run_completion(
     result_file: str,
     *,
     fixture: dict | None = None,
+    model_sha256: str | None = None,
 ) -> int:
     """Drive one completion, persist ``inferencex_result.json``, gate.
 
-    P1.10: ``fixture`` is an exact-token workload spec (prompt string +
-    n_predict + seed + temperature). The bench script sends this exact
-    payload to llama-server so re-runs on the same GGUF produce the
-    same token sequence after tokenization. The fixture itself is
-    hashed (see ``fixture_hash``) and recorded in the result payload so
-    audit replays can verify which workload was used.
+    P1.10 (5.1.3): ``fixture`` is an exact-token workload spec — the
+    prompt is a NUMERIC array of token IDs (not a string), ``n_predict``
+    is the integer continuation length, and ``seed`` / ``temperature``
+    pin the sampler. llama.cpp's ``/completion`` endpoint accepts
+    ``prompt`` as either a string or an array of integers; the integer
+    form bypasses the server's string-specific BOS insertion behaviour
+    and produces a deterministic token sequence for a given GGUF.
 
-    Pinned to a 4K-character prompt and 128 n_predict by default. The
-    prompt string is fixed; combined with the GGUF tokenizer it produces
-    a deterministic token sequence per GGUF. Bench scripts may override
-    by passing ``fixture=...``.
+    The fixture is keyed to a GGUF by ``model_sha256``; re-using a
+    fixture generated for a different GGUF would corrupt the audit trail
+    so ``run_completion`` refuses the mismatch. The fixture itself is
+    hashed and recorded in the result payload.
+
+    The bench script asserts ``timings["prompt_n"] == len(prompt_tokens)``
+    so a server that re-tokenizes the array (or skips it) is caught at
+    runtime.
     """
     if fixture is None:
         fixture = DEFAULT_FIXTURE
+    if "prompt_tokens" not in fixture:
+        _persist(
+            result_file,
+            fail_payload(model, ["fixture missing prompt_tokens (must be a numeric array)"]),
+        )
+        return 1
+    if model_sha256 is not None:
+        fixture_gguf = fixture.get("model_sha256")
+        if fixture_gguf and fixture_gguf != model_sha256:
+            _persist(
+                result_file,
+                fail_payload(
+                    model,
+                    [
+                        f"fixture generated for GGUF {fixture_gguf[:12]}, "
+                        f"current GGUF is {model_sha256[:12]}; refusing to run with "
+                        "mismatched fixture"
+                    ],
+                ),
+            )
+            return 1
     fixture_hash = hashlib.sha256(
         json.dumps(fixture, sort_keys=True).encode("utf-8")
     ).hexdigest()
-    prompt = fixture["prompt"]
+    prompt_tokens = list(fixture["prompt_tokens"])
+    if not all(isinstance(t, int) for t in prompt_tokens):
+        _persist(
+            result_file,
+            fail_payload(model, ["fixture.prompt_tokens contains non-integer values"]),
+        )
+        return 1
     n_predict = int(fixture.get("n_predict", 128))
     seed = int(fixture.get("seed", 0))
     temperature = float(fixture.get("temperature", 0.0))
     req = {
-        "prompt": prompt,
+        "prompt": prompt_tokens,
         "n_predict": n_predict,
         "temperature": temperature,
         "seed": seed,
@@ -191,6 +226,20 @@ def run_completion(
         return 1
     wall = time.monotonic() - start
     timings = parse_timings(body.get("timings", {}))
+    # Assert the server consumed our exact token array — no re-tokenization
+    # of a string, no BOS insertion, no truncation.
+    if timings["prompt_n"] != len(prompt_tokens):
+        _persist(
+            result_file,
+            fail_payload(
+                model,
+                [
+                    f"prompt_n mismatch: server consumed {timings['prompt_n']} tokens, "
+                    f"fixture had {len(prompt_tokens)}"
+                ],
+            ),
+        )
+        return 1
     quality_ok = bool(body.get("content")) and timings["eval_n"] > 0
     payload = build_result(model, wall, timings, quality_ok, body.get("context_size") or 0)
     # Audit fields: prove which exact-token workload produced these numbers.
@@ -198,7 +247,11 @@ def run_completion(
     payload["fixture_n_predict"] = n_predict
     payload["fixture_seed"] = seed
     payload["fixture_temperature"] = temperature
-    payload["fixture_prompt_chars"] = len(prompt)
+    payload["fixture_prompt_tokens_len"] = len(prompt_tokens)
+    payload["fixture_prompt_tokens_sha256"] = hashlib.sha256(
+        json.dumps(prompt_tokens).encode("utf-8")
+    ).hexdigest()
+    payload["fixture_model_sha256"] = fixture.get("model_sha256")
     _persist(result_file, payload)
     if not quality_ok:
         print("BENCH_FAIL: empty completion or zero eval tokens", file=sys.stderr)
@@ -207,24 +260,103 @@ def run_completion(
         f"pp={timings['pp_tok_s']:.1f} tok/s tg={timings['tg_tok_s']:.1f} tok/s "
         f"prompt_eval={timings['prompt_ms']:.0f} ms prompt_n={timings['prompt_n']} "
         f"eval_n={timings['eval_n']} wall={wall:.1f}s "
-        f"fixture={fixture_hash[:12]}"
+        f"fixture={fixture_hash[:12]} prompt_tokens={len(prompt_tokens)}"
     )
     return 0
 
 
-#: Default exact-token fixture. The prompt is a fixed string; combined
-#: with the GGUF tokenizer and the seed it produces a deterministic
-#: token sequence for a given GGUF. Bench scripts may override by
-#: passing ``fixture=...`` to ``run_completion``.
+#: Default exact-token fixture. The prompt is a NUMERIC array of token
+#: IDs (not a string) so re-runs against the same GGUF produce the same
+#: token sequence without BOS-insertion ambiguity. This fixture was
+#: generated by the pinned GGUF's tokenizer (see
+#: rdna/h05/fixtures/generate.py) and is keyed by ``model_sha256``.
 DEFAULT_FIXTURE: dict = {
-    "prompt": (
-        "The quick brown fox jumps over the lazy dog while the wise owl watches from "
-        "the oak tree. "
-    ) * 200,
+    "model_sha256": None,  # filled by the fixture loader
+    "prompt_tokens": [],  # filled by the fixture loader
     "n_predict": 128,
     "seed": 0,
     "temperature": 0.0,
 }
+
+
+# ---------------------------------------------------------------------------
+# Fixture loader + generator
+# ---------------------------------------------------------------------------
+
+
+def load_fixture(fixture_path: str) -> dict:
+    """Load a persisted fixture from disk.
+
+    Returns the parsed dict. The caller is expected to pass it to
+    ``run_completion(fixture=...)``.
+    """
+    path = Path(fixture_path)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def generate_fixture(
+    *,
+    port: int,
+    prompt_text: str,
+    model: str,
+    output_path: str,
+    n_predict: int = 128,
+    seed: int = 0,
+    temperature: float = 0.0,
+) -> dict:
+    """Generate an exact-token fixture from a running llama-server.
+
+    Calls ``POST /tokenize`` to convert the prompt string to token IDs
+    using the server's actual tokenizer, then persists a JSON file
+    containing ``{model_sha256, prompt_tokens, n_predict, seed,
+    temperature, source_prompt_sha256}``. Subsequent ``run_completion``
+    calls load this file and send ``prompt: prompt_tokens`` to
+    ``/completion`` directly, bypassing the server's string-tokenizer.
+
+    Refuses to write a fixture for a GGUF whose model_sha256 cannot be
+    computed (the bench script can pass it in via ``model_sha256=``).
+    """
+    import os as _os
+
+    if _os.path.exists(model) and not _os.path.isdir(model):
+        # Compute model sha256 once and embed in the fixture.
+        with open(model, "rb") as fh:
+            model_sha256 = hashlib.sha256(fh.read()).hexdigest()
+    else:
+        model_sha256 = "unknown-gguf"
+    req = {
+        "content": prompt_text,
+        "add_special": True,
+        "with_pieces": False,
+    }
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            f"http://127.0.0.1:{port}/tokenize",
+            data=json.dumps(req).encode(),
+            headers={"Content-Type": "application/json"},
+        ),
+        timeout=60,
+    ) as resp:
+        tokenize_body = json.loads(resp.read().decode())
+    tokens = tokenize_body.get("tokens")
+    if not tokens or not all(isinstance(t, int) for t in tokens):
+        raise RuntimeError(
+            f"/tokenize did not return an integer token array: "
+            f"{list(tokens)[:20] if tokens else 'empty'}"
+        )
+    fixture = {
+        "model_sha256": model_sha256,
+        "prompt_tokens": tokens,
+        "n_predict": n_predict,
+        "seed": seed,
+        "temperature": temperature,
+        "source_prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(fixture, indent=2), encoding="utf-8")
+    return fixture
 
 
 def _usage(prog: str) -> None:

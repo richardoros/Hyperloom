@@ -28,9 +28,12 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
+import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -54,10 +57,6 @@ class BuildProvenance:
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self), indent=2)
-
-
-import json
-import time
 
 
 def utc_now() -> str:
@@ -84,6 +83,78 @@ def _run_capture(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str, s
         return -1, "", f"{exc!r}"
 
 
+def _git_run(args: list[str], cwd: Path, timeout: float = 30.0) -> tuple[int, str, str]:
+    try:
+        out = subprocess.run(
+            args, cwd=str(cwd), capture_output=True, text=True, timeout=timeout, check=False
+        )
+        return out.returncode, out.stdout.strip(), out.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return -1, "", f"{exc!r}"
+
+
+def _resolve_clean_worktree(
+    source_repo: Path,
+    source_sha: Optional[str],
+    build_root: Path,
+) -> Path:
+    """Create a detached, CLEAN worktree at exactly ``source_sha``.
+
+    Raises on:
+      * missing source_sha argument (refuse to build "whatever HEAD is")
+      * dirty working tree in the source checkout
+      * git worktree creation failure
+      * HEAD != source_sha verification failure
+
+    Returns the worktree path; the caller MUST configure/build from
+    this path, not the original checkout.
+    """
+    if not source_sha:
+        raise RuntimeError(
+            "build_provenance requires source_sha; refusing to build "
+            "whatever the working tree happens to be"
+        )
+    if shutil.which("git") is None:
+        raise RuntimeError("git is required for build provenance")
+    rc, _, err = _git_run(["git", "rev-parse", "--is-inside-work-tree"], cwd=source_repo)
+    if rc != 0:
+        raise RuntimeError(f"{source_repo} is not a git work tree: {err}")
+    # Working tree must be CLEAN: no uncommitted, no staged. Otherwise
+    # we are not really building source_sha.
+    rc, _, _ = _git_run(["git", "diff", "--quiet"], cwd=source_repo)
+    if rc != 0:
+        raise RuntimeError(
+            f"{source_repo} has uncommitted changes; refusing to build (clean the tree first)"
+        )
+    rc, _, _ = _git_run(["git", "diff", "--cached", "--quiet"], cwd=source_repo)
+    if rc != 0:
+        raise RuntimeError(
+            f"{source_repo} has staged changes; refusing to build (clean the tree first)"
+        )
+    # Verify the source_repo HEAD is exactly source_sha.
+    rc, head, _ = _git_run(["git", "rev-parse", "HEAD"], cwd=source_repo)
+    if rc != 0 or head != source_sha:
+        raise RuntimeError(
+            f"{source_repo} HEAD is {head}, requested source_sha is {source_sha}"
+        )
+    # Create a detached worktree at source_sha. The worktree lives
+    # under build_root/ so production checkouts are not mutated.
+    worktree_path = build_root / "worktrees" / source_sha
+    rc, _, err = _git_run(
+        ["git", "worktree", "add", "--detach", str(worktree_path), source_sha],
+        cwd=source_repo,
+    )
+    if rc != 0:
+        raise RuntimeError(f"git worktree add failed: {err}")
+    # Verify HEAD in the worktree is exactly source_sha.
+    rc, wt_head, _ = _git_run(["git", "rev-parse", "HEAD"], cwd=worktree_path)
+    if rc != 0 or wt_head != source_sha:
+        raise RuntimeError(
+            f"worktree HEAD is {wt_head}, expected {source_sha}; refusing to build"
+        )
+    return worktree_path
+
+
 def build_candidate(
     *,
     source_repo: str,
@@ -97,11 +168,23 @@ def build_candidate(
 
     Layout:
 
+        build_root/worktrees/<source-sha>/                  (detached worktree)
         build_root/<source-sha>/<build_config_hash>/build/bin/<binary_name>
         build_root/<source-sha>/<build_config_hash>/build.log
-        build_root/<source-sha>/<build_config_hash>/build_manifest.json
 
-    Raises ``RuntimeError`` on cmake / build failure.
+    Provenance contract:
+      * The build is performed in an evaluator-owned detached worktree
+        at exactly ``source_sha``; the production checkout is never
+        modified.
+      * ``source_repo`` HEAD must equal ``source_sha`` AND the working
+        tree must be clean (no uncommitted, no staged). Refuses to
+        build otherwise — provenance would be ambiguous.
+      * ``build_config`` is parsed via ``shlex.split`` so quoted strings
+        and escapes are honoured.
+      * ``build_config_hash`` is the SHA-256 of the canonicalized config
+        so two builds with semantically-equal configs hash equal.
+
+    Raises ``RuntimeError`` on git / cmake / build failure.
     """
     source_repo = Path(source_repo).resolve()
     if not source_repo.is_dir():
@@ -109,20 +192,22 @@ def build_candidate(
     if not (source_repo / "CMakeLists.txt").is_file():
         raise RuntimeError(f"not a llama.cpp checkout (no CMakeLists.txt): {source_repo}")
 
+    build_root.mkdir(parents=True, exist_ok=True)
+    worktree = _resolve_clean_worktree(source_repo, source_sha, build_root)
     build_config_hash = hash_build_config(build_config)
-    target_dir = build_root / (source_sha or "unknown-sha") / build_config_hash
+    target_dir = build_root / source_sha / build_config_hash
     target_dir.mkdir(parents=True, exist_ok=True)
     build_dir = target_dir / "build"
     binary_path = build_dir / "bin" / binary_name
     log_path = target_dir / "build.log"
 
-    # Phase 1: cmake configure.
+    cmake_args = ["cmake", "-B", str(build_dir), "-S", str(worktree)]
+    if build_config:
+        cmake_args.extend(shlex.split(build_config))
+
+    # Phase 1: cmake configure (from the worktree, NEVER the production tree).
     rc, cmake_stdout, cmake_stderr = _run_capture(
-        ["cmake", "-B", str(build_dir), "-S", str(source_repo)] + (
-            build_config.split() if build_config else []
-        ),
-        cwd=source_repo,
-        timeout=600.0,
+        cmake_args, cwd=worktree, timeout=600.0,
     )
     if rc != 0:
         raise RuntimeError(f"cmake configure failed (rc={rc}): {cmake_stderr[-1000:]}")
@@ -130,12 +215,16 @@ def build_candidate(
     # Phase 2: cmake build.
     rc, build_stdout, build_stderr = _run_capture(
         ["cmake", "--build", str(build_dir), "--parallel"],
-        cwd=source_repo,
+        cwd=worktree,
         timeout=float(timeout_seconds),
     )
     log = (
+        "### worktree (detached) ###\n"
+        f"worktree: {worktree}\n"
+        f"source_sha: {source_sha}\n"
+        f"build_config_hash: {build_config_hash}\n\n"
         "### cmake configure ###\n"
-        f"$ cmake -B {build_dir} -S {source_repo} {build_config}\n"
+        f"$ {' '.join(cmake_args)}\n"
         f"{cmake_stdout}\n{cmake_stderr}\n\n"
         "### cmake build ###\n"
         f"$ cmake --build {build_dir} --parallel\n"
