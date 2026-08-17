@@ -61,6 +61,7 @@ import dataclasses
 import enum
 import json
 import os
+import signal
 import socket
 import sys
 import threading
@@ -68,7 +69,10 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-from .allowlist import DEFAULT_ALLOWLIST, ServiceEvent, is_active, stop_service
+from . import allowlist
+from .allowlist import DEFAULT_ALLOWLIST, ServiceEvent
+# These are module-qualified: functions use allowlist.is_active etc. so
+# tests can patch allowlist.is_active and the call still resolves.
 from .lock import LOCK_PATH, ExperimentLock
 from .ownership import ProcessGpuOwner, attribute_to_lab_gpu
 from .restore import RestorationRecord, RestoreTrap, write_audit
@@ -236,20 +240,19 @@ def _resolve_service_main_pid_and_pgid(
 
 
 def _drain_allowlist_pre(
-    allowlist: tuple[str, ...],
-) -> tuple[list[ServiceEvent], set[int], set[int], dict[str, str]]:
-    """Resolve PIDs/PGIDs BEFORE stopping services.
-
-    Returns events (stop actions taken), a set of PIDs to wait for,
-    a set of PGIDs (PGID-killable equivalents for the truncate PIDs),
-    and a service-name -> reason map for the audit.
+    services: tuple[str, ...],
+    *,
+    trap,
+) -> tuple[set[int], set[int], dict[str, str]]:
+    """Resolve PIDs/PGIDs BEFORE stopping services AND register each
+    stop with the active RestoreTrap so the trap restarts them on
+    every exit (including BLOCKED / exception paths).
     """
-    events: list[ServiceEvent] = []
     pids: set[int] = set()
     pgids: set[int] = set()
     reasons: dict[str, str] = {}
-    for name in allowlist:
-        if not is_active(name):
+    for name in services:
+        if not allowlist.is_active(name):
             continue
         pid, pgid = _resolve_service_main_pid_and_pgid(name)
         if pid is not None:
@@ -257,8 +260,9 @@ def _drain_allowlist_pre(
         if pgid is not None:
             pgids.add(pgid)
         reasons[name] = "stopped for exclusive-XTX window"
-        events.append(stop_service(name))
-    return events, pids, pgids, reasons
+        print('A', file=__import__('sys').stderr); evt = allowlist.stop_service(name); print('B', file=__import__('sys').stderr); print('evt=', repr(evt), file=__import__('sys').stderr)
+        print('about to record', file=__import__('sys').stderr); trap.record_stop_event(evt); print('after record, _stopped=', list(trap._stopped), file=__import__('sys').stderr)  # H0.6.3: trap owns the restart contract
+    return pids, pgids, reasons
 
 
 def _wait_for_pids_to_clear(
@@ -407,30 +411,38 @@ def run_lifecycle(
 ) -> LifecycleAudit:
     """Run the H0.6 lifecycle around the caller's measurement callable.
 
-    Args:
-        measurement: callable accepting a ``MeasurementContext`` and
-            returning either an ``int`` exit code or a
-            ``MeasurementResult``. The callable MUST call
-            ``ctx.register_candidate_pid(pid)`` after launching the
-            candidate so the restore trap can kill it.
-        experiment_id: integer written into the audit artifact.
-        artifact_dir: directory for the lifecycle audit JSON.
-        allowlist: services the orchestrator may stop.
-        lab_gpu_uuid / lab_gpu_bdf: overrides; defaults autodetect.
-        allowed_pids: PIDs that may legitimately use the lab GPU (e.g.
-            an embedding server the operator pinned).
-        snapshot_override: for tests; skip take_snapshot.
-        timeout_seconds: hard wall-clock deadline for the measurement
-            callable. ``None`` means no deadline (caller-supplied tests).
-        drain_wait_seconds: how long to wait for stopped services'
-            PIDs / VRAM to clear before re-attributing.
+    H0.6.3 sequencing — the RestoreTrap is active from drain start
+    through audit write:
+
+        snapshot
+        → acquire flock
+        → with RestoreTrap:
+            stop allowlisted services → trap.record_stop(...)
+            wait for pre-stop PIDs / PGIDs
+            attribute foreign owners → BLOCKED if any
+            run measurement (timeout via SIGALRM, trap record on exit)
+            kill candidate + restart services (trap __exit__)
+            capture ONE post-state snapshot
+            derive post_state_restored from pre vs post
+        → verify production, port, descendants → can flip PASS to FAIL
+        → release lock
+        → write audit (with the SAME post_state used for the decision)
+
+    The trap wraps drain + measurement + post-state capture. A
+    BLOCKED during drain still restarts anything that was stopped,
+    because the trap's __exit__ runs on every exit (success, raise,
+    SystemExit).
     """
     artifact_dir = Path(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     pre_state = snapshot_override or take_snapshot()
-    effective_uuid = lab_gpu_uuid or (pre_state.lab_gpu.uuid if pre_state.lab_gpu else "")
-    effective_bdf = lab_gpu_bdf or (pre_state.lab_gpu.bdf if pre_state.lab_gpu else "")
+    effective_uuid = lab_gpu_uuid or (
+        pre_state.lab_gpu.uuid if pre_state.lab_gpu else ""
+    )
+    effective_bdf = lab_gpu_bdf or (
+        pre_state.lab_gpu.bdf if pre_state.lab_gpu else ""
+    )
 
     ctx = MeasurementContext(
         register_candidate_pid=lambda _pid: None,
@@ -441,7 +453,6 @@ def run_lifecycle(
         experiment_id=experiment_id,
     )
 
-    # 1. Acquire exclusive flock.
     lock = ExperimentLock(LOCK_PATH)
     lock_held = lock.acquire(timeout_seconds=0.0)
     if not lock_held:
@@ -466,8 +477,6 @@ def run_lifecycle(
         )
         return audit
 
-    # Defaults for the post-try audit write.
-    services_to_restart: list[ServiceEvent] = []
     candidate_pid: Optional[int] = None
     candidate_pgid: Optional[int] = None
     candidate_exit: Optional[int] = None
@@ -476,230 +485,194 @@ def run_lifecycle(
     outcome: Outcome = Outcome.FAIL
     reason: str = "lifecycle did not reach PASS"
     foreign_owners: list[ProcessGpuOwner] = []
+    post_state: dict = {}
 
     try:
-        # 2. Resolve allowlisted-service PIDs / PGIDs BEFORE
-        #    stopping them (H0.6.2 — the post-stop MainPID is often
-        #    already cleared, so waiting on it is a no-op). Returns
-        #    the events created by stopping.
-        # 3. Stop allowlisted services.
-        services_to_restart, pre_stop_pids, pre_stop_pgids, _drain_reasons = (
-            _drain_allowlist_pre(allowlist)
-        )
-
-        # 4. Wait briefly for pre-stop PIDs AND PGIDs to clear. C5
-        #    uses the right primitive for each (os.kill vs. os.killpg).
-        survivors_p = _wait_for_pids_to_clear(
-            pre_stop_pids, timeout_seconds=drain_wait_seconds,
-        )
-        survivors_g = _wait_for_pgids_to_clear(
-            pre_stop_pgids, timeout_seconds=drain_wait_seconds,
-        )
-        survivors = survivors_p | survivors_g
-        if survivors:
-            outcome = Outcome.BLOCKED
-            reason = (
-                f"{len(survivors)} allowlisted service PID(s) survived "
-                f"drain: {sorted(survivors)}; not safe to proceed"
+        with RestoreTrap(pre_state) as trap:
+            pre_stop_pids, pre_stop_pgids, _drain_reasons = (
+                _drain_allowlist_pre(services=allowlist, trap=trap)
             )
-            early_exit = True
-        else:
-            early_exit = False
 
-        # 5. Attribute foreign owners to lab GPU (BDF-filtered).
-        if not early_exit:
-            explicit_allowed = set(allowed_pids) | pre_stop_pids
-            if effective_bdf and effective_uuid:
-                foreign_owners = attribute_to_lab_gpu(
-                    lab_gpu_bdf=effective_bdf,
-                    lab_gpu_uuid=effective_uuid,
-                    allowed_pids=explicit_allowed,
-                )
-            unknown_owners = [
-                o for o in foreign_owners if o.backend == "unknown"
-            ]
-            known_foreign = [
-                o for o in foreign_owners if o.backend != "unknown"
-            ]
-            # Apply the explicit_allowed filter at the orchestrator
-            # level too (the ownership function may or may not have
-            # filtered; this makes the gate's logic explicit).
-            allowed = set(allowed_pids) | pre_stop_pids
-            unknown_owners = [o for o in unknown_owners if o.pid not in allowed]
-            known_foreign = [o for o in known_foreign if o.pid not in allowed]
-            if unknown_owners:
+            survivors_p = _wait_for_pids_to_clear(
+                pre_stop_pids, timeout_seconds=drain_wait_seconds,
+            )
+            survivors_g = _wait_for_pgids_to_clear(
+                pre_stop_pgids, timeout_seconds=drain_wait_seconds,
+            )
+            survivors = survivors_p | survivors_g
+            if survivors:
                 outcome = Outcome.BLOCKED
                 reason = (
-                    f"{len(unknown_owners)} UNKNOWN XTX owner(s); their "
-                    "GPU attribution could not be resolved (CPU vs. GPU?). "
-                    "Operator must investigate before allowing H0.6 to "
-                    "attribute them."
+                    f"{len(survivors)} allowlisted service PID(s) survived "
+                    f"drain: {sorted(survivors)}; not safe to proceed"
                 )
-                early_exit = True
-            elif known_foreign:
-                outcome = Outcome.BLOCKED
-                reason = (
-                    f"{len(known_foreign)} foreign XTX owner(s) not in "
-                    "allowlist: must be killed or allowlisted explicitly."
-                )
-                early_exit = True
-
-        # 6. Run the measurement callable INSIDE the RestoreTrap so
-        #    the signal handlers cover the entire dangerous interval
-        #    (H0.6.2 — fix for restore-after-measurement). The
-        #    measurement launches its candidate under a new session;
-        #    the trap kills the entire PGID on exit (H0.6.2 — kill the
-        #    real descendant tree, not the wrapper PID). TIMEOUT is
-        #    enforced by the callable's own subprocess timeout; the
-        #    orchestrator classifies the resulting exit code as TIMEOUT
-        #    when the callable reports it.
-        if not early_exit:
-            with RestoreTrap(
-                pre_state,
-                services_to_restart=services_to_restart,
-            ) as trap:
-                # The MeasurementContext's register_candidate closures
-                # over the LIVE trap so the callable can register
-                # PGID/PID AFTER launch and the trap owns them for
-                # the rest of the lifetime.
-                ctx.register_candidate_pid = lambda pid: (
-                    trap.set_candidate_pid(pid)
-                )
-                ctx.register_candidate_pgid = lambda pgid: (
-                    trap.set_candidate_pgid(pgid)
-                )
-                # Expose the deadline through the context too. The
-                # callable is expected to enforce it on the
-                # subprocess it spawns.
-                ctx._deadline_seconds = timeout_seconds  # type: ignore[attr-defined]
-
-                raw_result: Optional[object] = None
-                error: Optional[BaseException] = None
-                try:
-                    raw_result = measurement(ctx)
-                except BaseException as exc:  # noqa: BLE001 - trap handles
-                    error = exc
-
-            # Trap's __exit__ has run; restoration record is populated
-            # and the candidate PGID/PID were killed (or never set).
-            restoration = trap.record
-            candidate_pid = trap.candidate_pid
-            candidate_pgid = trap.candidate_pgid
-
-            if error is not None:
-                candidate_exit = -1
-                if timed_out_marker := (
-                    "deadline" in str(error).lower() or "timeout" in str(error).lower()
-                ):
-                    timed_out = True
-                    outcome = Outcome.TIMEOUT
-                    reason = f"measurement raised a timeout-shaped error: {error!r}"
-                else:
-                    outcome = Outcome.FAIL
-                    reason = f"measurement raised: {error!r}"
-            elif raw_result is None:
-                candidate_exit = -1
-                outcome = Outcome.FAIL
-                reason = "measurement returned None"
             else:
-                try:
-                    coerced = _coerce_measurement_result(raw_result)
-                except TypeError as exc:
-                    candidate_exit = -2
-                    outcome = Outcome.FAIL
-                    reason = str(exc)
-                else:
-                    candidate_exit = coerced.exit_code
-                    if coerced.candidate_pid is not None:
-                        candidate_pid = coerced.candidate_pid
-                    # TIMEOUT shape: the callable explicitly flags a
-                    # timeout via ``timed_out=True`` on the result.
-                    # Also recognise exit=137 (SIGKILL) when the
-                    # caller requested a deadline, as a defensive
-                    # fallback for callables that didn't flag.
-                    if coerced.timed_out or (
-                        candidate_exit == 137 and timeout_seconds is not None
-                    ):
-                        timed_out = True
-                        outcome = Outcome.TIMEOUT
-                        reason = (
-                            f"candidate exited with SIGKILL (137) "
-                            f"after {timeout_seconds:.0f}s deadline"
-                        )
-                    elif candidate_exit != 0:
-                        outcome = Outcome.FAIL
-                        reason = (
-                            f"candidate exited with non-zero code "
-                            f"{candidate_exit}"
-                        )
-                    else:
-                        outcome = Outcome.PASS
-                        reason = "candidate exited 0; post-state to be verified"
-
-            # 7. Verify candidate port + descendant owners (H0.6.2).
-            #    Only meaningful when a PGID/PID was ever registered.
-            port_check = int(
-                os.environ.get("HYPERLOOM_EXPERIMENT_PORT", "18180")
-            )
-            port_gone = _verify_port_closed(port=port_check, timeout_seconds=5.0)
-            if (candidate_pgid is not None or candidate_pid is not None):
-                post_kill_owners = (
-                    attribute_to_lab_gpu(
+                explicit_allowed = set(allowed_pids) | pre_stop_pids
+                if effective_bdf and effective_uuid:
+                    foreign_owners = attribute_to_lab_gpu(
                         lab_gpu_bdf=effective_bdf,
                         lab_gpu_uuid=effective_uuid,
-                        allowed_pids=set(allowed_pids) | pre_stop_pids,
+                        allowed_pids=explicit_allowed,
                     )
-                    if effective_bdf and effective_uuid else []
-                )
-                descendants = [
-                    o for o in post_kill_owners
-                    if o.pid not in set(allowed_pids) | pre_stop_pids
+                unknown_owners = [
+                    o for o in foreign_owners if o.backend == "unknown"
                 ]
-                if not port_gone and outcome == Outcome.PASS:
-                    outcome = Outcome.FAIL
-                    reason = f"{reason}; candidate port still listening"
-                if descendants and outcome == Outcome.PASS:
-                    outcome = Outcome.FAIL
+                known_foreign = [
+                    o for o in foreign_owners if o.backend != "unknown"
+                ]
+                allowed_for_filter = set(allowed_pids) | pre_stop_pids
+                unknown_owners = [
+                    o for o in unknown_owners if o.pid not in allowed_for_filter
+                ]
+                known_foreign = [
+                    o for o in known_foreign if o.pid not in allowed_for_filter
+                ]
+                if unknown_owners:
+                    outcome = Outcome.BLOCKED
                     reason = (
-                        f"{reason}; {len(descendants)} descendant "
-                        f"XTX owner(s) still on GPU"
+                        f"{len(unknown_owners)} UNKNOWN XTX owner(s); their "
+                        "GPU attribution could not be resolved (CPU vs. GPU?). "
+                        "Operator must investigate before allowing H0.6 to "
+                        "attribute them."
+                    )
+                elif known_foreign:
+                    outcome = Outcome.BLOCKED
+                    reason = (
+                        f"{len(known_foreign)} foreign XTX owner(s) not in "
+                        "allowlist: must be killed or allowlisted explicitly."
+                    )
+                else:
+                    ctx.register_candidate_pid = lambda pid: (
+                        trap.set_candidate_pid(pid)
+                    )
+                    ctx.register_candidate_pgid = lambda pgid: (
+                        trap.set_candidate_pgid(pgid)
+                    )
+                    ctx._deadline_seconds = timeout_seconds  # type: ignore[attr-defined]
+
+                    raw_result, error = _run_measurement_with_sigalrm(
+                        measurement=measurement,
+                        ctx=ctx,
+                        timeout_seconds=timeout_seconds,
                     )
 
-        # 9. FRESH post-state probes (H0.6.1: never copy from pre-state).
-        post_state = _fresh_post_state(pre_state)
+                    if error is not None:
+                        candidate_exit = -1
+                        if (
+                            "deadline" in str(error).lower()
+                            or "timeout" in str(error).lower()
+                        ):
+                            timed_out = True
+                            outcome = Outcome.TIMEOUT
+                            reason = (
+                                f"measurement raised a timeout-shaped "
+                                f"error: {error!r}"
+                            )
+                        else:
+                            outcome = Outcome.FAIL
+                            reason = f"measurement raised: {error!r}"
+                    elif raw_result is None:
+                        candidate_exit = -1
+                        outcome = Outcome.FAIL
+                        reason = "measurement returned None"
+                    else:
+                        try:
+                            coerced = _coerce_measurement_result(raw_result)
+                        except TypeError as exc:
+                            candidate_exit = -2
+                            outcome = Outcome.FAIL
+                            reason = str(exc)
+                        else:
+                            candidate_exit = coerced.exit_code
+                            if coerced.candidate_pid is not None:
+                                candidate_pid = coerced.candidate_pid
+                            if (
+                                coerced.timed_out
+                                or (candidate_exit == 137 and timeout_seconds is not None)
+                            ):
+                                timed_out = True
+                                outcome = Outcome.TIMEOUT
+                                reason = (
+                                    f"candidate exited with SIGKILL (137) "
+                                    f"after {timeout_seconds:.0f}s deadline"
+                                )
+                            elif candidate_exit != 0:
+                                outcome = Outcome.FAIL
+                                reason = (
+                                    f"candidate exited with non-zero code "
+                                    f"{candidate_exit}"
+                                )
+                            else:
+                                outcome = Outcome.PASS
+                                reason = (
+                                    "candidate exited 0; post-state to be verified"
+                                )
 
-        # 10. Verify production.
-        prod_was_listening = next(
-            (l.listening for l in pre_state.listeners if l.port == 18079), False,
-        )
-        if prod_was_listening and not post_state["production_health_ok"]:
-            if outcome == Outcome.PASS:
-                outcome = Outcome.FAIL
-                reason = (
-                    "production 18079 was listening before H0.6 but "
-                    "not healthy after (post-state proved, not asserted)"
-                )
-        if outcome == Outcome.PASS:
-            unexpected_owners = [
-                o for o in post_state.get("foreign_owners", [])
-                if o.get("pid") not in (allowed_pids or ())
-                and o.get("pid") not in (pre_stop_pids or set())
-            ]
-            if unexpected_owners:
-                outcome = Outcome.FAIL
-                reason = (
-                    f"{len(unexpected_owners)} unexpected XTX owner(s) "
-                    f"appeared after the lifecycle; the lab is not clean"
-                )
+                    port_check = int(
+                        os.environ.get("HYPERLOOM_EXPERIMENT_PORT", "18180")
+                    )
+                    port_gone = _verify_port_closed(
+                        port=port_check, timeout_seconds=5.0
+                    )
+                    if (candidate_pgid is not None or candidate_pid is not None):
+                        post_kill_owners = (
+                            attribute_to_lab_gpu(
+                                lab_gpu_bdf=effective_bdf,
+                                lab_gpu_uuid=effective_uuid,
+                                allowed_pids=set(allowed_pids) | pre_stop_pids,
+                            )
+                            if effective_bdf and effective_uuid
+                            else []
+                        )
+                        descendants = [
+                            o for o in post_kill_owners
+                            if o.pid not in set(allowed_pids) | pre_stop_pids
+                        ]
+                        if not port_gone and outcome == Outcome.PASS:
+                            outcome = Outcome.FAIL
+                            reason = f"{reason}; candidate port still listening"
+                        if descendants and outcome == Outcome.PASS:
+                            outcome = Outcome.FAIL
+                            reason = (
+                                f"{reason}; {len(descendants)} descendant "
+                                f"XTX owner(s) still on GPU"
+                            )
 
+            # H0.6.3 / 6.3.3: ONE authoritative post-state snapshot is
+            # captured AND used to verify restoration. The same
+            # dict is persisted into the audit; we don't take a
+            # second snapshot later (drift risk).
+            post_state = _fresh_post_state(pre_state)
+
+        # Capture the trap's restoration record AFTER the with-block
+        # (the trap's record is populated in its __exit__).
+        restoration = trap.record
+        # H0.6.3 / 6.3.3: derive post_state_restored from the same
+        # authoritative post_state we just captured.
+        post_state_restored = _is_post_state_restored(pre_state, post_state)
+        if restoration is not None:
+            restoration = dataclasses.replace(
+                restoration, post_state_restored=post_state_restored
+            )
+            candidate_pid = restoration.candidate_pid
+            candidate_pgid = restoration.candidate_pgid
+        if outcome == Outcome.PASS and not (
+            restoration is not None and restoration.post_state_restored
+        ):
+            outcome = Outcome.FAIL
+            reason = "post_state_restored is False; check restoration.services_restarted vs pre_state"
     finally:
         lock.release()
 
+    services_restarted_objects = (
+        restoration.services_restarted if restoration is not None else []
+    )
+    foreign_owners_at_acquire = foreign_owners
     audit = _finalize_audit(
         outcome, reason, pre_state,
-        services_to_restart, foreign_owners,
+        services_restarted_objects, foreign_owners_at_acquire,
         candidate_pid, candidate_pgid, candidate_exit, timed_out, restoration,
-        _fresh_post_state(pre_state), start,
+        post_state, start,
     )
     write_audit(
         artifact_dir / f"lifecycle_{experiment_id}.json",
@@ -707,10 +680,15 @@ def run_lifecycle(
         exclusive_gate={
             "lab_gpu_uuid": effective_uuid,
             "lab_gpu_bdf": effective_bdf,
-            "foreign_owners": [dataclasses.asdict(o) for o in foreign_owners],
-            "services_stopped": [e.service for e in services_to_restart],
+            "foreign_owners": [dataclasses.asdict(o) for o in foreign_owners_at_acquire],
+            "services_stopped": [
+                e.service for e in services_restarted_objects
+            ],
             "timed_out": timed_out,
             "candidate_pgid": candidate_pgid,
+            "post_state_restored": (
+                restoration.post_state_restored if restoration is not None else False
+            ),
         },
         experiment_id=experiment_id,
         candidate_pid=candidate_pid,
@@ -721,10 +699,98 @@ def run_lifecycle(
             services_restarted=[], restored_at_utc=utc_now(),
             post_state_restored=False,
         ),
-        post_state=audit.post_state_fresh,
+        post_state=post_state,
         outcome=outcome.value,
     )
     return audit
+
+
+class _MeasurementTimeout(BaseException):
+    def __init__(self, seconds: float) -> None:
+        super().__init__(f"measurement exceeded {seconds:.2f}s deadline")
+        self.seconds = seconds
+
+
+def _run_measurement_with_sigalrm(
+    *,
+    measurement: Callable[[MeasurementContext], MeasurementReturn],
+    ctx: MeasurementContext,
+    timeout_seconds: Optional[float],
+) -> tuple[Optional[object], Optional[BaseException]]:
+    """Run ``measurement`` with a SIGALRM hard deadline.
+
+    H0.6.3 / 6.3.5: a real SIGALRM (Linux-only) is raised on the
+    main thread. ``RestoreTrap.__exit__`` still runs on timeout,
+    killing the candidate. Returns ``(raw_result, error)`` where
+    ``error`` is a ``_MeasurementTimeout`` on timeout.
+    """
+    raw_result: Optional[object] = None
+    error: Optional[BaseException] = None
+
+    if timeout_seconds is None or not hasattr(signal, "SIGALRM"):
+        try:
+            raw_result = measurement(ctx)
+        except BaseException as exc:  # noqa: BLE001
+            error = exc
+        return raw_result, error
+
+    def _on_alarm(sig, frame):  # noqa: ARG001
+        raise _MeasurementTimeout(timeout_seconds)
+
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
+    interval = max(0.5, float(timeout_seconds))
+    try:
+        signal.setitimer(signal.ITIMER_REAL, interval)
+        try:
+            raw_result = measurement(ctx)
+        except BaseException as exc:  # noqa: BLE001
+            error = exc
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    return raw_result, error
+
+
+def _is_post_state_restored(
+    pre_state: PreStateSnapshot,
+    post_state: dict,
+) -> bool:
+    """H0.6.3 / 6.3.3: deterministic pre-vs-post comparison.
+
+    Compares the captured pre_state against the freshly probed post_state.
+    All four checks must pass for True:
+
+    1. listeners dict matches (port -> listening).
+    2. services dict matches (name -> is_active).
+    3. production 18079 listening AND healthy if pre had it up.
+    4. no NEW foreign XTX owners appear (pre → post subset).
+    """
+    if not post_state:
+        return False
+    pre_listeners = {l.port: l.listening for l in pre_state.listeners}
+    post_listeners = {
+        l["port"]: l["listening"] for l in post_state.get("listeners", [])
+    }
+    if pre_listeners != post_listeners:
+        return False
+    pre_services = {s.name: s.is_active for s in pre_state.services}
+    post_services = {
+        s["name"]: s["is_active"] for s in post_state.get("services", [])
+    }
+    if pre_services != post_services:
+        return False
+    pre_prod_listening = next(
+        (l.listening for l in pre_state.listeners if l.port == 18079), False
+    )
+    if pre_prod_listening and not post_state.get("production_health_ok"):
+        return False
+    # H0.6.3 / 6.3.3: post_state.foreign_owners must be a SUBSET of
+    # pre_state.foreign_owners (no NEW XTX owners appeared).
+    pre_owners = {o.pid for o in pre_state.gpu_processes}
+    post_owners = {o["pid"] for o in post_state.get("foreign_owners", [])}
+    if not post_owners.issubset(pre_owners):
+        return False
+    return True
 
 
 def _finalize_audit(

@@ -108,22 +108,21 @@ def _kill_pgid(pgid: int, *, grace_seconds: float = 5.0) -> bool:
 class RestoreTrap:
     """Trap that restores the exact pre-state on any exit.
 
-    Usage (H0.6.2 — trap is active during the measurement itself):
+    Usage (H0.6.3 — trap is active from drain start through audit write):
 
-        trap = RestoreTrap(snapshot, services_to_restart=[...])
-        with trap:
-            measurement(ctx)   # signal handlers installed; if SIGTERM
-                                # arrives, the candidate PID + services
-                                # are restored before the signal is
-                                # re-raised.
+        with RestoreTrap(snapshot) as trap:
+            stop_allowlisted_services(trap=trap)  # drain FIRST
+            trap.record_stop(name)                   # after each stop
+            attributes = attribute_to_lab_gpu(...)
+            if foreign:
+                raise SystemExit  # trap still restarts
+            measurement(ctx)                        # covered by trap too
 
-        # inspect trap.record
+        # trap.record is populated regardless of how we exited.
 
     The candidate PID is set via :meth:`set_candidate_pid` so the
-    callable may register the PID AFTER the trap is active (e.g. the
-    PID of an externally-launched benchmark process). For process-
-    group kills, register the PGID via :meth:`set_candidate_pgid`
-    instead; the trap kills the entire process group on signal/exit.
+    callable may register the PID AFTER the trap is active. For
+    process-group kills, register the PGID via :meth:`set_candidate_pgid`.
     """
 
     def __init__(
@@ -135,14 +134,45 @@ class RestoreTrap:
         services_to_restart: Optional[list[ServiceEvent]] = None,
     ) -> None:
         self.snapshot = snapshot
-        # PID and PGID are mutable so the measurement callable can
-        # register them after the trap is already active. _run_restore()
-        # reads whatever the values are at exit time.
         self._candidate_pid: Optional[int] = candidate_pid
         self._candidate_pgid: Optional[int] = candidate_pgid
-        self.services_to_restart: list[ServiceEvent] = list(services_to_restart or [])
+        # Tracks services we've stopped so they MUST be restarted on
+        # every exit (BLOCKED included). The orchestrator pushes
+        # ServiceEvent entries here AS it stops them, not all upfront.
+        self._stopped: dict[str, ServiceEvent] = {}
+        if services_to_restart:
+            for evt in services_to_restart:
+                self._stopped[evt.service] = evt
         self.record: Optional[RestorationRecord] = None
         self._previous_handlers: dict[int, Callable] = {}
+
+    @property
+    def services_to_restart(self) -> list[ServiceEvent]:
+        """Read-only snapshot of all services the trap must restart.
+
+        Order is the order in which they were stopped.
+        """
+        return list(self._stopped.values())
+
+    def record_stop(self, service: str) -> None:
+        """Register ``service`` as stopped.
+
+        Called by the orchestrator immediately after a successful
+        ``stop_service(...)`` so the trap owns the restart contract.
+        """
+        if service in self._stopped:
+            return  # idempotent
+        self._stopped[service] = ServiceEvent(
+            service=service,
+            action="stop",
+            started_utc=utc_now(),
+            finished_utc=utc_now(),
+            returncode=0,
+        )
+
+    def record_stop_event(self, event: ServiceEvent) -> None:
+        """Register a precomputed ServiceEvent."""
+        self._stopped[event.service] = event
 
     def set_candidate_pid(self, pid: int) -> None:
         """Register the candidate's PID AFTER the trap is active."""
@@ -223,16 +253,23 @@ class RestoreTrap:
             return  # already restored; idempotent
         candidate_killed = self._kill_candidate()
         restart_events: list[ServiceEvent] = []
-        for evt in self.services_to_restart:
-            if evt.action == "stop":
-                restart_events.append(start_service(evt.service))
+        # Restart all services recorded via record_stop() — including
+        # ones stopped after the trap was entered. The BLOCKED-during-
+        # drain path is handled correctly: services stopped before
+        # the BLOCK condition was discovered are still restarted.
+        for service_name in list(self._stopped):
+            print('  start_service call', file=__import__('sys').stderr); restart_events.append(start_service(service_name))
         self.record = RestorationRecord(
             candidate_pid=self._candidate_pid,
             candidate_pgid=self._candidate_pgid,
             candidate_killed=candidate_killed,
             services_restarted=restart_events,
             restored_at_utc=utc_now(),
-            post_state_restored=True,
+            # post_state_restored is computed by the orchestrator
+            # after a fresh + authoritative post-state snapshot is
+            # captured and compared with pre_state. The trap does
+            # NOT hardcode this.
+            post_state_restored=False,
         )
 
     def __enter__(self) -> "RestoreTrap":

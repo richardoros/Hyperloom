@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import socket
 import subprocess
 import time
@@ -368,20 +369,35 @@ def _build_contention() -> list[str]:
 
 
 def _celery_cpu_percent(*, sample_seconds: float = 1.0) -> Optional[float]:
-    """Sum the CPU% of all processes matching ``celery ... worker`` over
-    a 1-second sample.
+    """Sum CPU jiffy rate across all ``celery.*worker`` processes.
 
-    C4: the previous version counted Celery workers and BLOCKED on
-    ``count > 0``. JustApply ships a fleet of Celery workers that
-    sit idle (0% CPU) most of the time; that is NOT a contention
-    signal. The gate now samples actual CPU consumption across all
-    Celery workers. JustApply's fleet is tolerated when it is not
-    burning CPU.
+    H0.6.3 / C6: the previous version used ``top -p pid1,pid2,...,pidN``,
+    which is capped at 20 PIDs by procps-ng. JustApply's fleet is
+    bigger (~48 workers); the cap made the celery signal fail-open
+    on the actual production host.
 
-    Returns the sum of ``%CPU`` across matching processes (via
-    ``ps -p <pid> -o %cpu=`` averaged across the sample window), or
-    None if Celery processes could not be enumerated.
+    The new implementation walks ``/proc/<pid>/stat`` directly and
+    samples utime+stime twice (``ticks`` at ``t0`` and ``t1``); the
+    delta is divided by (elapsed time × USER_HZ × cores) to get a real
+    CPU percentage. Works for any worker count.
+
+    Returns the SUM of CPU percentages (so a fleet burning 50%/worker
+    is reported as fleet load). Returns 0.0 if no Celery workers
+    exist. Returns None only on ``/proc`` read failure (fail-closed
+    at the gate).
     """
+    try:
+        clk_tck = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError):
+        clk_tck = 100
+    try:
+        ncpu = len(
+            [ln for ln in Path("/proc/cpuinfo").read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines() if ln.lower().startswith("processor")]
+        ) or 1
+    except OSError:
+        ncpu = 1
     try:
         ps = subprocess.run(
             ["pgrep", "-af", "celery.*worker"],
@@ -390,7 +406,7 @@ def _celery_cpu_percent(*, sample_seconds: float = 1.0) -> Optional[float]:
     except (OSError, subprocess.TimeoutExpired):
         return None
     if not ps.stdout.strip():
-        return 0.0  # Celery never run; 0% by definition
+        return 0.0
     pids: list[int] = []
     for line in ps.stdout.splitlines():
         parts = line.split(None, 1)
@@ -402,43 +418,47 @@ def _celery_cpu_percent(*, sample_seconds: float = 1.0) -> Optional[float]:
             continue
     if not pids:
         return 0.0
-    # Sample top -b -n2 to get %CPU per pid; sum. ``top`` reports the
-    # % across one second by default; the sample window keeps it
-    # bounded.
-    try:
-        out = subprocess.run(
-            ["top", "-b", "-n2", "-d", str(max(0.5, sample_seconds)),
-             "-p", ",".join(str(p) for p in pids)],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+
+    def _sample(cpu_times: dict[int, tuple[int, int]]) -> bool:
+        cpu_times.clear()
+        for pid in pids:
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return False
+            # Field 14 = utime, 15 = stime. The comm is in parens with spaces
+            # in the name so we split from the right: pid starts field 1 and
+            # state is field 3. Field 14 = utime, 15 = stime.
+            try:
+                fields = stat.rsplit(")", 1)[-1].split()
+                # After the rsplit(')'), field 3 (state) becomes index 0,
+                # field 14 (utime) index 11, field 15 (stime) index 12.
+                utime = int(fields[11]); stime = int(fields[12])
+            except (IndexError, ValueError):
+                return False
+            cpu_times[pid] = (utime, stime)
+        return True
+
+    t0 = time.monotonic()
+    cpu_t0: dict[int, tuple[int, int]] = {}
+    if not _sample(cpu_t0):
         return None
-    totals: dict[int, float] = {p: 0.0 for p in pids}
-    samples_per_pid: dict[int, int] = {p: 0 for p in pids}
-    current_pid: Optional[int] = None
-    for line in out.stdout.splitlines():
-        line = line.strip()
-        # top -b lines look like: "  PID USER      PR  NI    VIRT    RES   SHR S  %CPU  %MEM     TIME+ COMMAND"
-        # then "  1234 user ..." rows.
-        parts = line.split()
-        if len(parts) < 10 or not parts[0].isdigit():
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
-        if pid not in totals:
-            continue
-        try:
-            cpu = float(parts[8])
-        except (ValueError, IndexError):
-            continue
-        totals[pid] += cpu
-        samples_per_pid[pid] += 1
-    if not samples_per_pid or not any(samples_per_pid.values()):
+    time.sleep(max(0.5, sample_seconds))
+    cpu_t1: dict[int, tuple[int, int]] = {}
+    if not _sample(cpu_t1):
         return None
-    averages = [totals[p] / samples_per_pid[p] for p in pids if samples_per_pid[p] > 0]
-    return sum(averages)
+    elapsed = max(1e-6, time.monotonic() - t0)
+    totals: list[float] = []
+    for pid in pids:
+        if pid not in cpu_t0 or pid not in cpu_t1:
+            continue
+        u0, s0 = cpu_t0[pid]
+        u1, s1 = cpu_t1[pid]
+        delta_ticks = max(0, (u1 - u0) + (s1 - s0))
+        # ticks / (ticks-per-second * seconds * cores) * 100
+        pct = (delta_ticks / (clk_tck * elapsed * ncpu)) * 100.0
+        totals.append(pct)
+    return sum(totals)
 
 
 def _vram_rocm_smi() -> tuple[int, int]:

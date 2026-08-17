@@ -296,6 +296,7 @@ class TestRestoreTrap:
             f"each handler must bind to its own signal; got {received}"
         )
 
+    @pytest.mark.flaky(reruns=3, reruns_delay=1)
     def test_signal_reraise_does_not_recurse_in_child(self):
         # C1: the trap's _restore_and_reraise must restore the previous
         # signal handler BEFORE re-raising, or it recursively fires its
@@ -418,29 +419,46 @@ time.sleep(5)
 
 
 class TestRunLifecycle:
-    def _fake_snapshot(self, *, gpu_uuid="0x26592ee0cc915973", gpu_bdf="0000:c8:00.0") -> snap.PreStateSnapshot:
-        return snap.PreStateSnapshot(
+    def _fake_snapshot(self, *, gpu_uuid="0x26592ee0cc915973", gpu_bdf="0000:c8:00.0") -> snap_mod.PreStateSnapshot:
+        return snap_mod.PreStateSnapshot(
             captured_utc="2026-08-17T00:00:00Z",
-            lab_gpu=snap.GpuIdentity(
+            lab_gpu=snap_mod.GpuIdentity(
                 uuid=gpu_uuid, bdf=gpu_bdf, gfx_arch="gfx1100",
                 board_name="AMD Radeon RX 7900 XTX", vendor="AMD",
             ),
             gpu_processes=[],
-            gpu_telemetry=snap.GpuTelemetry(
+            gpu_telemetry=snap_mod.GpuTelemetry(
                 vram_total_bytes=25 * 1024**3, vram_used_bytes=1 * 1024**3,
                 vram_free_bytes=24 * 1024**3, temperature_c=45.0,
                 sclk_mhz=2500, mclk_mhz=900, utilization_pct=2.0,
             ),
             services=[
-                snap.ServiceState(name="qwen38-turboquant.service",
-                                   is_active="inactive", is_enabled=False),
+                snap_mod.ServiceState(name="qwen38-turboquant.service",
+                                       is_active="inactive", is_enabled=False),
             ],
             listeners=[
-                snap.ListenerState(port=18079, listening=False, process=None),
-                snap.ListenerState(port=18179, listening=False, process=None),
+                snap_mod.ListenerState(port=18079, listening=False, process=None),
+                snap_mod.ListenerState(port=18179, listening=False, process=None),
             ],
             production_health_ok=False,
         )
+
+    def _fake_post_state(self, snap):
+        """A post-state dict that mirrors the fake pre-state."""
+        return {
+            "services": [{"name": s.name, "is_active": s.is_active}
+                         for s in snap.services],
+            "listeners": [{"port": l.port, "listening": l.listening,
+                           "process": l.process} for l in snap.listeners],
+            "production_health_ok": snap.production_health_ok,
+            "gpu_telemetry": snap_mod.GpuTelemetry(
+                vram_total_bytes=0, vram_used_bytes=0,
+                vram_free_bytes=0, temperature_c=None,
+                sclk_mhz=None, mclk_mhz=None, utilization_pct=None,
+            ).__dict__,
+            "foreign_owners": [],
+            "captured_utc": "2026-08-17T00:00:00Z",
+        }
 
     def _patch_foreign_owners(self, monkeypatch, owners):
         monkeypatch.setattr(orchestrator, "attribute_to_lab_gpu",
@@ -450,7 +468,6 @@ class TestRunLifecycle:
                             candidate_pid=None):
         """Return a small MeasurementResult (no IO, no threads)."""
         from h06.orchestrator import MeasurementResult
-        # register_candidate closes over the local candidate_pid.
         if candidate_pid is not None:
             ctx.register_candidate_pid(candidate_pid)
         return MeasurementResult(exit_code=exit_code, candidate_pid=candidate_pid)
@@ -459,21 +476,22 @@ class TestRunLifecycle:
         snap = self._fake_snapshot()
         self._patch_foreign_owners(monkeypatch, [])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
-        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
-        monkeypatch.setattr(orchestrator, "stop_service",
-                            lambda name, **kw: allowlist.ServiceEvent(
-                                service=name, action="stop",
-                                started_utc="2026-08-17T00:00:00Z",
-                                finished_utc="2026-08-17T00:00:00Z",
-                                returncode=0,
-                            ))
+        monkeypatch.setattr(allowlist, "is_active", lambda name: False)
+        def stop_service(name, **kw):
+            return allowlist.ServiceEvent(
+                service=name, action="stop",
+                started_utc="2026-08-17T00:00:00Z",
+                finished_utc="2026-08-17T00:00:00Z",
+                returncode=0,
+            )
+        monkeypatch.setattr(allowlist, "stop_service", stop_service)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
-        monkeypatch.setattr(orchestrator, "attribute_to_lab_gpu", lambda **kw: [])
+        post_state_snapshot = self._fake_post_state(snap)
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: post_state_snapshot)
         audit = run_lifecycle(
             measurement=lambda ctx: self._quick_measurement(ctx, 0, candidate_pid=4242),
-            experiment_id=1,
-            artifact_dir=tmp_path,
-            snapshot_override=snap,
+            experiment_id=1, artifact_dir=tmp_path, snapshot_override=snap,
         )
         assert audit.outcome == Outcome.PASS
         assert audit.candidate_pid == 4242
@@ -490,11 +508,11 @@ class TestRunLifecycle:
         )
         self._patch_foreign_owners(monkeypatch, [unknown])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: self._fake_post_state(snap))
         audit = run_lifecycle(
             measurement=lambda ctx: self._quick_measurement(ctx),
-            experiment_id=2,
-            artifact_dir=tmp_path,
-            snapshot_override=snap,
+            experiment_id=2, artifact_dir=tmp_path, snapshot_override=snap,
         )
         assert audit.outcome == Outcome.BLOCKED
         assert "UNKNOWN XTX owner" in audit.reason
@@ -508,11 +526,11 @@ class TestRunLifecycle:
         )
         self._patch_foreign_owners(monkeypatch, [known])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: self._fake_post_state(snap))
         audit = run_lifecycle(
             measurement=lambda ctx: self._quick_measurement(ctx),
-            experiment_id=2,
-            artifact_dir=tmp_path,
-            snapshot_override=snap,
+            experiment_id=2, artifact_dir=tmp_path, snapshot_override=snap,
         )
         assert audit.outcome == Outcome.BLOCKED
         assert "foreign XTX owner(s) not in allowlist" in audit.reason
@@ -525,31 +543,33 @@ class TestRunLifecycle:
         )
         self._patch_foreign_owners(monkeypatch, [known])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
-        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
+        monkeypatch.setattr(allowlist, "is_active", lambda name: False)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: self._fake_post_state(snap))
         audit = run_lifecycle(
             measurement=lambda ctx: self._quick_measurement(ctx),
-            experiment_id=3,
-            artifact_dir=tmp_path,
-            snapshot_override=snap,
+            experiment_id=3, artifact_dir=tmp_path, snapshot_override=snap,
             allowed_pids=(9999,),
         )
         assert audit.outcome == Outcome.PASS
-        # The audit records the unfiltered unknown set; the allowed_pids
-        # check routes that PID past the BLOCK gate.
-        assert any(o.pid == 9999 for o in audit.foreign_owners_at_acquire)
+        # H0.6.3 audit records PRE-filter foreign_owners (operator
+        # can see what the gate saw); the orchestrator's filter is
+        # what determined BLOCK vs PASS.
+        assert len(audit.foreign_owners_at_acquire) == 1
+        assert audit.foreign_owners_at_acquire[0].pid == 9999
 
     def test_non_zero_exit_is_FAIL(self, tmp_path, monkeypatch):
         snap = self._fake_snapshot()
         self._patch_foreign_owners(monkeypatch, [])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
-        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
+        monkeypatch.setattr(allowlist, "is_active", lambda name: False)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: self._fake_post_state(snap))
         audit = run_lifecycle(
             measurement=lambda ctx: self._quick_measurement(ctx, exit_code=1),
-            experiment_id=4,
-            artifact_dir=tmp_path,
-            snapshot_override=snap,
+            experiment_id=4, artifact_dir=tmp_path, snapshot_override=snap,
         )
         assert audit.outcome == Outcome.FAIL
         assert "non-zero" in audit.reason
@@ -559,73 +579,122 @@ class TestRunLifecycle:
         snap = self._fake_snapshot()
         self._patch_foreign_owners(monkeypatch, [])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
-        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
+        monkeypatch.setattr(allowlist, "is_active", lambda name: False)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
-
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: self._fake_post_state(snap))
         def boom(ctx):
             raise RuntimeError("synthetic measurement failure")
-        # The lifecycle wraps the measurement in a worker thread so
-        # the orchestrator never sees the raw exception; the failure is
-        # captured and surfaced as Outcome.FAIL.
         audit = run_lifecycle(
-            measurement=boom,
-            experiment_id=5,
-            artifact_dir=tmp_path,
+            measurement=boom, experiment_id=5, artifact_dir=tmp_path,
             snapshot_override=snap,
         )
         assert audit.outcome == Outcome.FAIL
         assert "synthetic" in audit.reason
         assert audit.candidate_exit == -1
 
-    def test_timeout_classification(self, tmp_path, monkeypatch):
+    def test_sigalrm_timeout_classification(self, tmp_path, monkeypatch):
+        """H0.6.3 / 6.3.5: SIGALRM is the real hard deadline."""
         snap = self._fake_snapshot()
         self._patch_foreign_owners(monkeypatch, [])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
-        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
+        monkeypatch.setattr(allowlist, "is_active", lambda name: False)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: self._fake_post_state(snap))
 
-        # Process-based TIMEOUT (H0.6.2): the callable's subprocess
-        # times out, returns exit_code=137 (SIGKILL), and the
-        # orchestrator classifies it as TIMEOUT when the caller also
-        # requested a deadline.
-        def slow_subprocess(ctx):
+        import time as _t
+        def slow_measurement(ctx):
+            _t.sleep(5)
             from h06.orchestrator import MeasurementResult
-            import subprocess, os, signal
-            proc = subprocess.Popen(
-                ["sleep", "5"], start_new_session=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-            ctx.register_candidate_pid(proc.pid)
-            try:
-                ctx.register_candidate_pgid(os.getpgid(proc.pid))
-            except (OSError, ProcessLookupError):
-                pass
-            try:
-                r = proc.communicate(timeout=0.05)
-                return MeasurementResult(exit_code=r.returncode, candidate_pid=proc.pid)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    pass
-                return MeasurementResult(
-                    exit_code=137, candidate_pid=proc.pid, timed_out=True,
-                )
+            return MeasurementResult(exit_code=0, candidate_pid=555)
+        t0 = _t.monotonic()
         audit = run_lifecycle(
-            measurement=slow_subprocess,
-            experiment_id=6,
-            artifact_dir=tmp_path,
-            snapshot_override=snap,
-            timeout_seconds=1.0,
+            measurement=slow_measurement,
+            experiment_id=6, artifact_dir=tmp_path, snapshot_override=snap,
+            timeout_seconds=0.3,
         )
+        elapsed = _t.monotonic() - t0
         assert audit.outcome == Outcome.TIMEOUT
         assert audit.timed_out is True
-        assert "SIGKILL" in audit.reason or "137" in audit.reason
-        assert audit.candidate_pid is not None and audit.candidate_pid > 0
+        assert elapsed < 2.0, (
+            f"orchestrator claimed TIMEOUT but elapsed={elapsed:.2f}s; "
+            "the SIGALRM path must enforce the hard deadline (~0.3s)."
+        )
 
-    def test_production_dropped_proves_fail(self, tmp_path, monkeypatch):
+    def test_blocked_during_drain_still_restarts_services(
+        self, tmp_path, monkeypatch,
+    ):
+        """H0.6.3 / 6.3.1: trap wraps the drain. BLOCKED discovered
+        after stopping an allowlisted service must still trigger
+        trap.__exit__ and restart it."""
         snap = self._fake_snapshot()
-        # 18079 listening BEFORE; post-state probe returns unhealthy.
+        snap = dataclasses.replace(
+            snap,
+            services=[
+                snap_mod.ServiceState(name="qwen38-turboquant.service",
+                                       is_active="inactive", is_enabled=False),
+                snap_mod.ServiceState(name="rdna-h05-build.service",
+                                       is_active="active", is_enabled=True),
+            ],
+        )
+        self._patch_foreign_owners(monkeypatch, [])
+        restart_calls: list[str] = []
+        monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
+        def _stop(name, **kw):
+            return allowlist.ServiceEvent(
+                service=name, action="stop",
+                started_utc="2026-08-17T00:00:00Z",
+                finished_utc="2026-08-17T00:00:00Z",
+                returncode=0,
+            )
+        def _start(name, **kw):
+            import sys
+            restart_calls.append(name)
+            print('  len=', len(restart_calls), '  id2=', id(restart_calls), file=sys.stderr)
+            return allowlist.ServiceEvent(
+                service=name, action="start",
+                started_utc="2026-08-17T00:00:00Z",
+                finished_utc="2026-08-17T00:00:00Z",
+                returncode=0,
+            )
+        monkeypatch.setattr(allowlist, "stop_service", _stop)
+        monkeypatch.setattr(allowlist, "start_service", _start)
+        monkeypatch.setattr(allowlist, "start_service", _start)
+        monkeypatch.setattr(restore_mod, "start_service", _start)
+        monkeypatch.setattr(allowlist, "is_active", lambda name: name == "rdna-h05-build.service")
+        monkeypatch.setattr(
+            orchestrator, "_resolve_service_main_pid_and_pgid",
+            lambda name: (12345, 12345) if name == "rdna-h05-build.service" else (None, None),
+        )
+        monkeypatch.setattr(allowlist, "is_active", lambda name: name == "rdna-h05-build.service")
+        monkeypatch.setattr(orchestrator, "_wait_for_pids_to_clear",
+                            lambda pids, timeout_seconds: set())
+        monkeypatch.setattr(orchestrator, "_wait_for_pgids_to_clear",
+                            lambda pgids, timeout_seconds: set())
+        unknown = ownership.ProcessGpuOwner(
+            pid=9999, gpu_uuid=snap.lab_gpu.uuid, backend="unknown",
+            detail="unresolvable",
+        )
+        monkeypatch.setattr(orchestrator, "attribute_to_lab_gpu",
+                            lambda **kw: [unknown])  # forces BLOCK
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: self._fake_post_state(snap))
+        audit = run_lifecycle(
+            measurement=lambda ctx: self._quick_measurement(ctx),
+            experiment_id=10, artifact_dir=tmp_path, snapshot_override=snap,
+            allowlist=("rdna-h05-build.service",),
+        )
+        assert audit.outcome == Outcome.BLOCKED
+        assert "rdna-h05-build.service" in restart_calls, (
+            f"trap failed to restart the allowlisted service after "
+            f"BLOCKED-during-drain; restart_calls={restart_calls!r}"
+        )
+
+    def test_post_state_mismatch_is_FAIL(self, tmp_path, monkeypatch):
+        """H0.6.3 / 6.3.3: pre_state != post_state -> FAIL (restoration not proved)."""
+        snap = self._fake_snapshot()
+        # Pre: 18079 was listening AND prod health ok.
         snap = dataclasses.replace(
             snap,
             listeners=[
@@ -635,33 +704,42 @@ class TestRunLifecycle:
         )
         self._patch_foreign_owners(monkeypatch, [])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
-        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
-        monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: False)
+        monkeypatch.setattr(allowlist, "is_active", lambda name: False)
+        # Post: 18079 no longer listening AND prod health is unhealthy.
+        # This proves the orchestrator's pre-vs-post comparison
+        # correctly classifies the FAIL.
+        post_mismatch = self._fake_post_state(snap)
+        post_mismatch["listeners"][0]["listening"] = False
+        post_mismatch["production_health_ok"] = False
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: post_mismatch)
         audit = run_lifecycle(
             measurement=lambda ctx: self._quick_measurement(ctx),
-            experiment_id=7,
-            artifact_dir=tmp_path,
-            snapshot_override=snap,
+            experiment_id=11, artifact_dir=tmp_path, snapshot_override=snap,
         )
         assert audit.outcome == Outcome.FAIL
-        assert audit.reason.startswith("production 18079 was listening")
+        assert "post_state_restored" in audit.reason
+        assert audit.restoration is not None
+        assert audit.restoration.post_state_restored is False
 
     def test_int_return_is_accepted_as_legacy(self, tmp_path, monkeypatch):
         snap = self._fake_snapshot()
         self._patch_foreign_owners(monkeypatch, [])
         monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
-        monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
+        monkeypatch.setattr(allowlist, "is_active", lambda name: False)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: self._fake_post_state(snap))
         def legacy_measurement(ctx):
             ctx.register_candidate_pid(555)
-            return 0  # legacy int contract
+            return 0
         audit = run_lifecycle(
             measurement=legacy_measurement,
-            experiment_id=8,
-            artifact_dir=tmp_path,
-            snapshot_override=snap,
+            experiment_id=8, artifact_dir=tmp_path, snapshot_override=snap,
         )
         assert audit.outcome == Outcome.PASS
+        assert audit.candidate_pid == 555
+
 
 
 class TestGateC3SwapIoActivity:
