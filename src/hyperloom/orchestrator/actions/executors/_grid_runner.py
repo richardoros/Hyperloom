@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -34,6 +34,7 @@ from hyperloom.common.env_safety import (
 
 from ...phases import machine_state as _phase_state
 from ...roles.robustness_pulse import pulse as _robustness_pulse
+from ...trace.task_progress import heartbeat_while_output_flows, report_progress
 from ..cancel_channel import stop_was_asked_for
 from ..stop_attribution import (
     ORCHESTRATOR_CANCELLED_CLASS,
@@ -70,7 +71,6 @@ from ._inferencex_patcher import (
 
 # Re-exported from sibling modules to keep the module namespace intact.
 from ._grid_base import (
-    _MAGPIE_CWD_DEFAULT as _MAGPIE_CWD_DEFAULT,
     _VARIANT_TIMEOUT_SEC_DEFAULT as _VARIANT_TIMEOUT_SEC_DEFAULT,
     GridVariant as GridVariant,
     coerce_extra_envs as coerce_extra_envs,
@@ -949,6 +949,7 @@ def _run_magpie(
     server_already_ready: bool = False,
     serving_lease: Any = None,
     session_deadline_sec: float | None = None,
+    on_output: Callable[[], None] | None = None,
 ) -> tuple[int, str, str]:
     """Blocking subprocess wrapper. Returns (rc, stdout, stderr).
 
@@ -984,6 +985,10 @@ def _run_magpie(
             including the accuracy eval that retires ``soft_deadline_sec``. The
             lease path sends it across as a remaining-seconds duration, the only
             form that means the same thing in the actor's process.
+        on_output: Liveness callback invoked from the reader thread on each
+            line the benchmark emits, so the caller's heartbeat can keep
+            reporting across a run that blocks for hours. Ignored on the
+            ``serving_lease`` path — see the note there.
 
     Returns:
         tuple[int, str, str]: ``(returncode, stdout, stderr)``.
@@ -1079,6 +1084,11 @@ def _run_magpie(
             config_path=ray_config_path,
             output_dir=output_dir,
         )
+        # ``on_output`` cannot follow the round here: the benchmark runs inside a
+        # Ray actor in another process (potentially on another node) and only its
+        # final ``(rc, stdout, stderr)`` comes back, so there is nothing local to
+        # call per line. A Ray-backed variant therefore reports on entry and then
+        # goes quiet until it returns — a known gap, not an oversight.
         return serving_lease.run_session_kill(
             cmd,
             env=env,
@@ -1108,6 +1118,7 @@ def _run_magpie(
         server_log_path=str(output_dir / "server.log"),
         server_already_ready=server_already_ready,
         session_deadline_sec=session_deadline_sec,
+        on_output=on_output,
     )
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
@@ -1317,6 +1328,41 @@ def session_grid_bounds(shared_state: Any) -> tuple[float | None, float | None]:
     return (deadline, variant_sec)
 
 
+def _variant_progress_note(
+    grid: list[GridVariant],
+    results: list[VariantResult],
+    idx: int,
+) -> dict[str, Any]:
+    """Build the progress note for the variant at ``idx`` from that variant's own row.
+
+    The row is located by index and never taken from the tail of ``results``: a
+    stop cause that ends the batch records the round it stopped and then a
+    not-run row for every later variant, so the tail is the last variant in the
+    grid rather than the one that just ran. Each variant contributes exactly one
+    row, in order, before it reports, which is what makes ``idx`` where its row
+    is. The log line beside this note derives from ``idx`` already; the note is
+    the artefact the heartbeat exists to make honest, and the one a stall signal
+    reads, so it cannot be the one that names the wrong variant.
+
+    Args:
+        grid (list[GridVariant]): The variants being run.
+        results (list[VariantResult]): Rows recorded so far.
+        idx (int): Zero-based index of the variant being reported.
+
+    Returns:
+        dict[str, Any]: Keyword note for :func:`report_progress`.
+    """
+    landed = results[idx] if idx < len(results) else None
+    return {
+        "unit": "variant",
+        "label": grid[idx].name,
+        "index": idx + 1,
+        "total": len(grid),
+        "status": getattr(landed, "status", None),
+        "output_throughput": getattr(landed, "output_throughput", None),
+    }
+
+
 async def run_grid(
     *,
     base_yaml_path: Path,
@@ -1324,7 +1370,6 @@ async def run_grid(
     grid: list[GridVariant],
     output_root: Path,
     magpie_python: str | None = None,
-    cwd: str = _MAGPIE_CWD_DEFAULT,
     variant_timeout_sec: int = _VARIANT_TIMEOUT_SEC_DEFAULT,
     keep_going_on_failure: bool = True,
     model_path: str | None = None,
@@ -1368,6 +1413,13 @@ async def run_grid(
       outlive the whole session: explore derives caps up to 4h from the measured
       baseline and never consulted the budget, so a 3h run could grant one
       variant more time than the run was given.
+
+    Every pass runs with ``output_root`` as its working directory, the way the
+    baseline arm anchors Magpie to its own output dir. That is what marks the
+    benchmark subtree as this session's on a shared node: the robustness reactor
+    only believes a load generator that it can tie to the session, and a grid
+    launched from the system temp directory carried no such tie, so a server
+    dying mid-variant read as the idle gap between two variants.
     """
     if not magpie_python:
         # Backend-aware: bypass uses a plain python3, not Magpie's venv.
@@ -1380,6 +1432,11 @@ async def run_grid(
         warmup_before_measure = _run_grid_warmup_enabled()
     auto_warmup_requested = bool(warmup_before_measure and server_lifecycle is None)
     results: list[VariantResult] = []
+    # This function names the working directory, so it creates it: callers and
+    # the per-variant config writer both happen to create it first today, and
+    # neither is a contract. The old system-temp default never needed one.
+    output_root.mkdir(parents=True, exist_ok=True)
+    cwd = str(output_root)
 
     # Reap orphaned aiter JIT build locks before booting any server. A prior GPU
     # process killed mid-``hipcc`` (e.g. an OOM'd co-scheduled server, or a
@@ -1421,19 +1478,65 @@ async def run_grid(
         except Exception as exc:  # noqa: BLE001 - reference base is additive; never block the grid
             log.debug("grid_runner: reference env resolve swallowed: %r", exc)
 
-    # Variant-boundary robustness pulse: a bounded tick after every variant so
-    # a mid-grid leak/crash surfaces between variants. Best-effort.
-    async def _pulse_after_variant(idx: int) -> None:
-        """Run a best-effort robustness pulse after a variant completes.
+    # Reported on entry, not on completion: ``_pulse_after_variant`` only runs once a
+    # result has been appended, so a first variant that hangs — or a branch that
+    # raises before reaching it — would emit nothing at all, which is exactly
+    # the silence the heartbeat exists to break.
+    async def _unit_started(idx: int, label: str) -> None:
+        """Report that a unit of variant ``idx`` is about to start.
 
-        Skipped once the action has been asked to stop. A cooperative stop
-        returns its sentinel rather than raising, so this is reached on the
-        ordinary path with the cancel already outstanding, and the tick is a
-        subprocess spawned and waited out for its whole timeout -- serially,
-        between recording the row and releasing what the round held, inside the
-        one window the canceller allows the entire unwind. What it would observe
-        is the reap the orchestrator just ordered, and what waiting for it costs
-        is every row this grid has already built.
+        Args:
+            idx (int): Zero-based index of the variant the unit belongs to.
+            label (str): Unit name (``"variant"``, ``"warmup"``, ...).
+        """
+        await report_progress(
+            unit="variant_step",
+            label=f"{grid[idx].name}:{label}",
+            index=idx + 1,
+            total=len(grid),
+            status="started",
+        )
+
+    async def _reported_magpie(idx: int, label: str, **kwargs: Any) -> tuple[int, str, str]:
+        """Run one Magpie pass, announced on entry and kept alive by its output.
+
+        The entry note covers the wait before the child says anything; the
+        heartbeat covers the hours after it does. Without the second half a
+        benchmark could hold the row silent for a whole variant timeout against
+        a suppression window three orders of magnitude shorter.
+
+        Args:
+            idx (int): Zero-based index of the variant this pass belongs to.
+            label (str): Unit name (``"warmup"``, ``"mn_warmup"``,
+                ``"benchmark"``).
+            **kwargs (Any): Forwarded to :func:`_run_magpie`.
+
+        Returns:
+            tuple[int, str, str]: ``(returncode, stdout, stderr)``.
+        """
+        await _unit_started(idx, label)
+        async with heartbeat_while_output_flows(
+            unit="variant_step",
+            label=f"{grid[idx].name}:{label}",
+            index=idx + 1,
+            total=len(grid),
+        ) as activity:
+            return await asyncio.to_thread(_run_magpie, on_output=activity.note, **kwargs)
+
+    # Variant boundary: a bounded robustness tick so a mid-grid leak/crash
+    # surfaces between variants, plus a progress heartbeat so a grid that runs
+    # for hours is distinguishable from one that hung on its first variant.
+    # Both best-effort.
+    async def _pulse_after_variant(idx: int) -> None:
+        """Report the finished variant and run a best-effort robustness pulse.
+
+        Called once the variant's result has been appended, so the progress
+        note carries what actually landed. Skipped for the pulse itself once
+        the action has been asked to stop: a cooperative stop returns its
+        sentinel rather than raising, so this is reached on the ordinary path
+        with the cancel already outstanding, and the tick is a subprocess
+        spawned and waited out for its whole timeout. The progress note is
+        cheap and is what keeps the stall row from staying at ``started``.
 
         The gate is the cancel scope rather than the round's returncode because a
         variant can be failing for its own reasons when the cancel lands: that
@@ -1446,6 +1549,7 @@ async def run_grid(
             idx (int): Zero-based index of the just-finished variant, passed
                 through as the pulse ``tick_index``.
         """
+        await report_progress(**_variant_progress_note(grid, results, idx))
         if stop_was_asked_for():
             log.info(
                 "grid_runner: variant %d/%d robustness pulse skipped; the orchestrator cancelled this action",
@@ -1653,6 +1757,7 @@ async def run_grid(
         # cannot overrun the close window).
         if _skip_rest_for_budget(i, spent_on="the variants before this one"):
             break
+        await _unit_started(i, "variant")
         slot = output_root / f"variant_{i:02d}_{_safe(variant.name)}"
         server_log = slot / "server.log"
         # Capability fast-fail: drop a variant whose env flag the build cannot
@@ -1844,8 +1949,9 @@ async def run_grid(
                 reserve_sec=float(variant_expected_sec or 0.0) * (1 + _mn_warmup_rounds),
             )
             try:
-                warmup_rc, warmup_stdout, warmup_stderr = await asyncio.to_thread(
-                    _run_magpie,
+                warmup_rc, warmup_stdout, warmup_stderr = await _reported_magpie(
+                    i,
+                    "warmup",
                     magpie_python=magpie_python,
                     config_path=warmup_cfg_path,
                     output_dir=warmup_slot,
@@ -2053,6 +2159,7 @@ async def run_grid(
                     note=variant.note,
                 )
             )
+            await _pulse_after_variant(i)
             if not keep_going_on_failure:
                 break
             continue
@@ -2090,8 +2197,9 @@ async def run_grid(
             # discarding it launches the measured round after the cancel.
             _mn_warm_rc: int | None = None
             try:
-                _mn_warm_rc, _, _ = await asyncio.to_thread(
-                    _run_magpie,
+                _mn_warm_rc, _, _ = await _reported_magpie(
+                    i,
+                    "mn_warmup",
                     magpie_python=magpie_python,
                     config_path=cfg_path,
                     output_dir=_mn_warm_slot,
@@ -2143,8 +2251,9 @@ async def run_grid(
         slot_workspaces_before = snapshot_workspaces(slot)
         variant_started_unix = time.time()
         try:
-            rc, stdout, stderr = await asyncio.to_thread(
-                _run_magpie,
+            rc, stdout, stderr = await _reported_magpie(
+                i,
+                "benchmark",
                 magpie_python=magpie_python,
                 config_path=cfg_path,
                 output_dir=slot,

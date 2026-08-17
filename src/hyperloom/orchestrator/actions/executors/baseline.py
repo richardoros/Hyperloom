@@ -35,6 +35,7 @@ from hyperloom.common.git_safety import safe_directory_args
 from hyperloom.inference_optimizer.session.session_paths import runs_dir
 from ...loop.sub_agent_runner import RunnerContext
 from ...phases import machine_state as _phase_state
+from ...trace.task_progress import heartbeat_while_output_flows, report_progress
 from ..stop_attribution import (
     SESSION_TIME_EXHAUSTED_CLASS,
     STOPPED_BY_THE_RUN,
@@ -3245,7 +3246,8 @@ class BaselineExecutor:
                     lifecycle["reason"],
                 )
             try:
-                result = await self._run_single_benchmark(
+                result = await self._run_reported_round(
+                    label="single",
                     config_path=config_path,
                     output_dir=output_dir,
                     **common,
@@ -3308,7 +3310,8 @@ class BaselineExecutor:
             # first and a budget kill is recorded as one. Whether the measured
             # round can follow is asked after this pass, priced with what it
             # actually cost rather than a prediction of what it would.
-            warmup_result = await self._run_single_benchmark(
+            warmup_result = await self._run_reported_round(
+                label="warmup",
                 config_path=warmup_cfg,
                 output_dir=warmup_dir,
                 **common,
@@ -3341,6 +3344,15 @@ class BaselineExecutor:
             warmup_tput = warmup_result.get("output_throughput")
             warmup_runtime = warmup_result.get("subprocess_runtime_sec")
             warmup_post_ready = warmup_result.get("post_ready_runtime_sec")
+            await report_progress(
+                unit="baseline_round",
+                label="warmup",
+                index=1,
+                total=2,
+                status="succeeded",
+                output_throughput=warmup_tput,
+                runtime_sec=warmup_runtime,
+            )
 
             if not defer_accuracy_until_after_measure:
                 affordable, gate_evidence = self._measure_round_affordable(
@@ -3402,7 +3414,8 @@ class BaselineExecutor:
                 measure_dir,
                 warmup_tput or 0.0,
             )
-            result = await self._run_single_benchmark(
+            result = await self._run_reported_round(
+                label="measure",
                 config_path=measure_cfg,
                 output_dir=measure_dir,
                 **common,
@@ -3509,7 +3522,8 @@ class BaselineExecutor:
                             )
                         except (TypeError, ValueError):
                             accuracy_timeout_sec = timeout_sec
-                        accuracy_result = await self._run_single_benchmark(
+                        accuracy_result = await self._run_reported_round(
+                            label="accuracy",
                             config_path=accuracy_cfg,
                             output_dir=accuracy_dir,
                             **{
@@ -4047,15 +4061,20 @@ class BaselineExecutor:
             warm_env["EVAL_RESULT_DIR"] = str(warm_dir / "eval_output")
             warm_env["SERVER_LOG"] = str(warm_dir / "server.log")
             warm_env["GPU_METRICS_CSV"] = str(warm_dir / "gpu_metrics.csv")
-            warm_proc = await asyncio.to_thread(
-                run_with_session_kill,
-                warm_cmd,
-                env=warm_env,
-                cwd=str(warm_dir),
-                timeout=timeout_sec,
-                server_log_path=_watchdog_server_log_path(warm_dir, framework),
-                session_deadline_sec=session_deadline_sec,
-            )
+            async with heartbeat_while_output_flows(
+                unit="baseline_round",
+                label="mn_warmup",
+            ) as _mn_warm_activity:
+                warm_proc = await asyncio.to_thread(
+                    run_with_session_kill,
+                    warm_cmd,
+                    env=warm_env,
+                    cwd=str(warm_dir),
+                    timeout=timeout_sec,
+                    server_log_path=_watchdog_server_log_path(warm_dir, framework),
+                    session_deadline_sec=session_deadline_sec,
+                    on_output=_mn_warm_activity.note,
+                )
             warm_rc = warm_proc.returncode
             log.info("baseline_executor: MN warmup pass done (discarded) rc=%s", warm_rc)
         except subprocess.TimeoutExpired as exc:
@@ -4075,6 +4094,37 @@ class BaselineExecutor:
                 capture_meta=capture_meta,
             )
         return None
+
+    async def _run_reported_round(
+        self,
+        *,
+        label: str,
+        config_path: Path,
+        output_dir: Path,
+        **common: Any,
+    ) -> dict[str, Any]:
+        """Announce a benchmark round before it blocks, then run it.
+
+        Reported on entry, not on completion: a round can boot a server, warm
+        JIT and bench for the better part of an hour, and one that never
+        returns is exactly the case the heartbeat has to be able to show.
+
+        Args:
+            label (str): Round name carried on the progress note
+                (``"single"``, ``"warmup"``, ``"measure"``, ``"accuracy"``).
+            config_path (Path): The materialized Magpie YAML for this round.
+            output_dir (Path): The per-round workspace slot.
+            **common (Any): Remaining :meth:`_run_single_benchmark` arguments.
+
+        Returns:
+            dict[str, Any]: The round's benchmark result, unchanged.
+        """
+        await report_progress(unit="baseline_round", label=label, status="started")
+        return await self._run_single_benchmark(
+            config_path=config_path,
+            output_dir=output_dir,
+            **common,
+        )
 
     async def _run_single_benchmark(
         self,
@@ -4320,6 +4370,12 @@ class BaselineExecutor:
                     config_path=ray_config_path,
                     output_dir=output_dir,
                 )
+                # No liveness callback is possible here: the round runs inside a
+                # Ray actor in another process (potentially on another node) and
+                # only its final ``(rc, stdout, stderr)`` crosses back, so there
+                # is nothing local to call per line of child output. A Ray-backed
+                # round reports on entry and then goes quiet until it returns — a
+                # known gap, not an oversight.
                 proc_returncode, proc_stdout, proc_stderr = await asyncio.to_thread(
                     serving_lease.run_session_kill,
                     ray_cmd,
@@ -4331,15 +4387,20 @@ class BaselineExecutor:
                 )
                 subprocess_runtime_sec = max(0.0, time.time() - subprocess_started_unix)
             else:
-                proc = await asyncio.to_thread(
-                    run_with_session_kill,
-                    cmd,
-                    env=env,
-                    cwd=str(output_dir),
-                    timeout=timeout_sec,
-                    server_log_path=watchdog_server_log,
-                    session_deadline_sec=session_deadline_sec,
-                )
+                async with heartbeat_while_output_flows(
+                    unit="baseline_round",
+                    label="benchmark",
+                ) as activity:
+                    proc = await asyncio.to_thread(
+                        run_with_session_kill,
+                        cmd,
+                        env=env,
+                        cwd=str(output_dir),
+                        timeout=timeout_sec,
+                        server_log_path=watchdog_server_log,
+                        session_deadline_sec=session_deadline_sec,
+                        on_output=activity.note,
+                    )
                 subprocess_runtime_sec = max(
                     0.0,
                     time.time() - subprocess_started_unix,
