@@ -61,6 +61,7 @@ import dataclasses
 import enum
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -100,6 +101,7 @@ class LifecycleAudit:
     owners_stopped: list[ServiceEvent]
     foreign_owners_at_acquire: list[ProcessGpuOwner]
     candidate_pid: Optional[int]
+    candidate_pgid: Optional[int]
     candidate_exit: Optional[int]
     timed_out: bool
     restoration: Optional[RestorationRecord]
@@ -111,6 +113,25 @@ class LifecycleAudit:
         return json.dumps(dataclasses.asdict(self), indent=2)
 
 
+def _verify_port_closed(*, port: int, timeout_seconds: float = 5.0) -> bool:
+    """Return True once the TCP probe shows the port has gone away.
+
+    Used after the trap exits to verify the candidate's listening
+    port is genuinely gone (proves the process tree was reaped).
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                if s.connect_ex(("127.0.0.1", port)) != 0:
+                    return True
+        except OSError:
+            return True
+        time.sleep(0.1)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Measurement protocol
 # ---------------------------------------------------------------------------
@@ -120,33 +141,34 @@ class LifecycleAudit:
 class MeasurementContext:
     """Handle handed to the measurement callable.
 
-    The callable may call ``register_candidate(pid)`` immediately after
-    launching the candidate process so the restore trap can kill it
-    when the lifecycle ends (timeout, signal, exception, FAIL).
+    The callable may call ``register_candidate_pid(pid)`` and/or
+    ``register_candidate_pgid(pgid)`` immediately after launching the
+    candidate process so the restore trap can kill it when the
+    lifecycle ends (timeout, signal, exception, FAIL). Prefer PGID
+    (process-group kill) so the candidate's descendants (driver
+    threads, child shells) are reaped too.
 
     The callable should return ``MeasurementResult`` carrying both the
     exit code AND the candidate PID (last known) so the orchestrator
     can record provenance even if the candidate crashed without
-    ``register_candidate`` being called.
+    ``register_candidate_pid`` being called.
 
     A plain ``int`` return is also accepted (legacy contract): exit 0
     means PASS, non-zero means FAIL.
     """
-    register_candidate: Callable[[int], None]
+    register_candidate_pid: Callable[[int], None]
+    register_candidate_pgid: Callable[[int], None]
     pre_state: PreStateSnapshot
     lab_gpu_uuid: str
     lab_gpu_bdf: str
     experiment_id: int
-
-    def register_candidate_pid(self, pid: int) -> None:
-        """Convenience wrapper: ``ctx.register_candidate_pid(pid)``."""
-        self.register_candidate(pid)
 
 
 @dataclasses.dataclass(frozen=True)
 class MeasurementResult:
     exit_code: int
     candidate_pid: Optional[int] = None
+    timed_out: bool = False
 
 
 MeasurementReturn = Union[int, MeasurementResult]
@@ -193,23 +215,50 @@ def _resolve_service_main_pid(service_name: str) -> Optional[int]:
     return pid if pid > 0 else None
 
 
-def _drain_allowlist(
-    allowlist: tuple[str, ...],
-) -> tuple[list[ServiceEvent], set[int]]:
-    """Stop allowlisted services; return events + their MainPIDs.
+def _resolve_service_main_pid_and_pgid(
+    service_name: str,
+) -> tuple[Optional[int], Optional[int]]:
+    """Resolve the service's MainPID AND its process-group ID.
 
-    The returned PIDs must be implicitly allowed during the subsequent
-    GPU ownership check (their VRAM is in the process of freeing).
+    The MainPID alone is unreliable after a stop (the service may have
+    already cleared it). For draining GPU services the PGID is more
+    useful: a service launched by systemd in user mode joins a
+    dedicated PGID.
+    """
+    pid = _resolve_service_main_pid(service_name)
+    if pid is None:
+        return None, None
+    try:
+        pgid = os.getpgid(pid)
+    except (OSError, ProcessLookupError):
+        pgid = None
+    return pid, pgid
+
+
+def _drain_allowlist_pre(
+    allowlist: tuple[str, ...],
+) -> tuple[list[ServiceEvent], set[int], set[int], dict[str, str]]:
+    """Resolve PIDs/PGIDs BEFORE stopping services.
+
+    Returns events (stop actions taken), a set of PIDs to wait for,
+    a set of PGIDs (PGID-killable equivalents for the truncate PIDs),
+    and a service-name -> reason map for the audit.
     """
     events: list[ServiceEvent] = []
     pids: set[int] = set()
+    pgids: set[int] = set()
+    reasons: dict[str, str] = {}
     for name in allowlist:
-        if is_active(name):
-            events.append(stop_service(name))
-            pid = _resolve_service_main_pid(name)
-            if pid is not None:
-                pids.add(pid)
-    return events, pids
+        if not is_active(name):
+            continue
+        pid, pgid = _resolve_service_main_pid_and_pgid(name)
+        if pid is not None:
+            pids.add(pid)
+        if pgid is not None:
+            pgids.add(pgid)
+        reasons[name] = "stopped for exclusive-XTX window"
+        events.append(stop_service(name))
+    return events, pids, pgids, reasons
 
 
 def _wait_for_pids_to_clear(
@@ -334,7 +383,8 @@ def run_lifecycle(
     effective_bdf = lab_gpu_bdf or (pre_state.lab_gpu.bdf if pre_state.lab_gpu else "")
 
     ctx = MeasurementContext(
-        register_candidate=lambda _pid: None,
+        register_candidate_pid=lambda _pid: None,
+        register_candidate_pgid=lambda _pgid: None,
         pre_state=pre_state,
         lab_gpu_uuid=effective_uuid,
         lab_gpu_bdf=effective_bdf,
@@ -348,7 +398,7 @@ def run_lifecycle(
         outcome = Outcome.BLOCKED
         reason = "another evaluator holds the exclusive XTX lock"
         audit = _finalize_audit(
-            outcome, reason, pre_state, [], [], None, None, False, None,
+            outcome, reason, pre_state, [], [], None, None, None, False, None,
             start,
         )
         write_audit(
@@ -358,7 +408,7 @@ def run_lifecycle(
                              "foreign_owners": [], "services_stopped": []},
             experiment_id=experiment_id, candidate_pid=None, candidate_exit=None,
             restoration=RestorationRecord(
-                candidate_pid=None, candidate_killed=False,
+                candidate_pid=None, candidate_pgid=None, candidate_killed=False,
                 services_restarted=[], restored_at_utc=utc_now(),
                 post_state_restored=False,
             ),
@@ -369,6 +419,7 @@ def run_lifecycle(
     # Defaults for the post-try audit write.
     services_to_restart: list[ServiceEvent] = []
     candidate_pid: Optional[int] = None
+    candidate_pgid: Optional[int] = None
     candidate_exit: Optional[int] = None
     timed_out: bool = False
     restoration: Optional[RestorationRecord] = None
@@ -377,19 +428,19 @@ def run_lifecycle(
     foreign_owners: list[ProcessGpuOwner] = []
 
     try:
-        # 2. Resolve allowlisted-service PIDs BEFORE stopping them
-        # so they're implicitly allowed during the subsequent GPU
-        # ownership check (their VRAM is in the process of freeing).
+        # 2. Resolve allowlisted-service PIDs / PGIDs BEFORE
+        #    stopping them (H0.6.2 — the post-stop MainPID is often
+        #    already cleared, so waiting on it is a no-op). Returns
+        #    the events created by stopping.
         # 3. Stop allowlisted services.
-        pre_stop_pids = {
-            _resolve_service_main_pid(name) for name in allowlist
-        }
-        pre_stop_pids.discard(None)
-        services_to_restart, drain_pids = _drain_allowlist(allowlist)
+        services_to_restart, pre_stop_pids, pre_stop_pgids, _drain_reasons = (
+            _drain_allowlist_pre(allowlist)
+        )
 
-        # 4. Wait briefly for PIDs / VRAM to clear.
+        # 4. Wait briefly for the pre-stop PIDs / PGIDs to clear.
         survivors = _wait_for_pids_to_clear(
-            drain_pids, timeout_seconds=drain_wait_seconds,
+            pre_stop_pids | pre_stop_pgids,
+            timeout_seconds=drain_wait_seconds,
         )
         if survivors:
             outcome = Outcome.BLOCKED
@@ -439,59 +490,64 @@ def run_lifecycle(
                 )
                 early_exit = True
 
-        # 6. Run the measurement callable in a worker thread (H0.6.1
-        #    mechanical timeout). The thread is a daemon so we never
-        #    block exit; we also track the candidate PID via the
-        #    context's register_candidate callback.
+        # 6. Run the measurement callable INSIDE the RestoreTrap so
+        #    the signal handlers cover the entire dangerous interval
+        #    (H0.6.2 — fix for restore-after-measurement). The
+        #    measurement launches its candidate under a new session;
+        #    the trap kills the entire PGID on exit (H0.6.2 — kill the
+        #    real descendant tree, not the wrapper PID). TIMEOUT is
+        #    enforced by the callable's own subprocess timeout; the
+        #    orchestrator classifies the resulting exit code as TIMEOUT
+        #    when the callable reports it.
         if not early_exit:
-            result_holder: dict = {"value": None, "error": None}
-
-            def _ctx_for_pid():
-                # The MeasurementContext is constructed below; we
-                # cannot pass ctx here (created after function defs).
-                return ctx
-
-            def _reg(pid: int) -> None:
-                nonlocal candidate_pid
-                candidate_pid = pid
-                ctx.register_candidate = _reg  # update closure for later
-                ctx._candidate_pid = pid  # type: ignore[attr-defined]
-
-            ctx.register_candidate = _reg
-
-            def _worker() -> None:
-                try:
-                    result_holder["value"] = measurement(ctx)
-                except BaseException as exc:  # noqa: BLE001 - trap will catch on restore
-                    result_holder["error"] = exc
-                    result_holder["value"] = None
-
-            thread = threading.Thread(target=_worker, daemon=True)
-            ctx.register_candidate_pid = ctx.register_candidate  # for docs
-            thread.start()
-            if timeout_seconds is not None:
-                thread.join(timeout=timeout_seconds)
-            else:
-                thread.join()
-
-            if thread.is_alive():
-                timed_out = True
-                # The candidate will be killed below by the trap. The
-                # measurement's return value is unknown at this
-                # point; mark as 137 (SIGKILL) for audit purposes.
-                candidate_exit = 137
-                outcome = Outcome.TIMEOUT
-                reason = (
-                    f"measurement did not complete within "
-                    f"{timeout_seconds:.0f}s; candidate PID "
-                    f"{candidate_pid} will be SIGTERM-then-SIGKILLed"
+            with RestoreTrap(
+                pre_state,
+                services_to_restart=services_to_restart,
+            ) as trap:
+                # The MeasurementContext's register_candidate closures
+                # over the LIVE trap so the callable can register
+                # PGID/PID AFTER launch and the trap owns them for
+                # the rest of the lifetime.
+                ctx.register_candidate_pid = lambda pid: (
+                    trap.set_candidate_pid(pid)
                 )
-            elif result_holder["error"] is not None:
+                ctx.register_candidate_pgid = lambda pgid: (
+                    trap.set_candidate_pgid(pgid)
+                )
+                # Expose the deadline through the context too. The
+                # callable is expected to enforce it on the
+                # subprocess it spawns.
+                ctx._deadline_seconds = timeout_seconds  # type: ignore[attr-defined]
+
+                raw_result: Optional[object] = None
+                error: Optional[BaseException] = None
+                try:
+                    raw_result = measurement(ctx)
+                except BaseException as exc:  # noqa: BLE001 - trap handles
+                    error = exc
+
+            # Trap's __exit__ has run; restoration record is populated
+            # and the candidate PGID/PID were killed (or never set).
+            restoration = trap.record
+            candidate_pid = trap.candidate_pid
+            candidate_pgid = trap.candidate_pgid
+
+            if error is not None:
+                candidate_exit = -1
+                if timed_out_marker := (
+                    "deadline" in str(error).lower() or "timeout" in str(error).lower()
+                ):
+                    timed_out = True
+                    outcome = Outcome.TIMEOUT
+                    reason = f"measurement raised a timeout-shaped error: {error!r}"
+                else:
+                    outcome = Outcome.FAIL
+                    reason = f"measurement raised: {error!r}"
+            elif raw_result is None:
                 candidate_exit = -1
                 outcome = Outcome.FAIL
-                reason = f"measurement raised: {result_holder['error']!r}"
+                reason = "measurement returned None"
             else:
-                raw_result = result_holder["value"]
                 try:
                     coerced = _coerce_measurement_result(raw_result)
                 except TypeError as exc:
@@ -502,7 +558,21 @@ def run_lifecycle(
                     candidate_exit = coerced.exit_code
                     if coerced.candidate_pid is not None:
                         candidate_pid = coerced.candidate_pid
-                    if candidate_exit != 0:
+                    # TIMEOUT shape: the callable explicitly flags a
+                    # timeout via ``timed_out=True`` on the result.
+                    # Also recognise exit=137 (SIGKILL) when the
+                    # caller requested a deadline, as a defensive
+                    # fallback for callables that didn't flag.
+                    if coerced.timed_out or (
+                        candidate_exit == 137 and timeout_seconds is not None
+                    ):
+                        timed_out = True
+                        outcome = Outcome.TIMEOUT
+                        reason = (
+                            f"candidate exited with SIGKILL (137) "
+                            f"after {timeout_seconds:.0f}s deadline"
+                        )
+                    elif candidate_exit != 0:
                         outcome = Outcome.FAIL
                         reason = (
                             f"candidate exited with non-zero code "
@@ -512,20 +582,39 @@ def run_lifecycle(
                         outcome = Outcome.PASS
                         reason = "candidate exited 0; post-state to be verified"
 
-        # 7. Trap runs in __exit__ — the candidate PID we registered
-        #    is killed, services we stopped are restarted.
-        with RestoreTrap(
-            pre_state,
-            candidate_pid=candidate_pid,
-            services_to_restart=services_to_restart,
-        ) as trap:
-            pass
-        restoration = trap.record
+            # 7. Verify candidate port + descendant owners (H0.6.2).
+            #    Only meaningful when a PGID/PID was ever registered.
+            port_check = int(
+                os.environ.get("HYPERLOOM_EXPERIMENT_PORT", "18180")
+            )
+            port_gone = _verify_port_closed(port=port_check, timeout_seconds=5.0)
+            if (candidate_pgid is not None or candidate_pid is not None):
+                post_kill_owners = (
+                    attribute_to_lab_gpu(
+                        lab_gpu_bdf=effective_bdf,
+                        lab_gpu_uuid=effective_uuid,
+                        allowed_pids=set(allowed_pids) | pre_stop_pids,
+                    )
+                    if effective_bdf and effective_uuid else []
+                )
+                descendants = [
+                    o for o in post_kill_owners
+                    if o.pid not in set(allowed_pids) | pre_stop_pids
+                ]
+                if not port_gone and outcome == Outcome.PASS:
+                    outcome = Outcome.FAIL
+                    reason = f"{reason}; candidate port still listening"
+                if descendants and outcome == Outcome.PASS:
+                    outcome = Outcome.FAIL
+                    reason = (
+                        f"{reason}; {len(descendants)} descendant "
+                        f"XTX owner(s) still on GPU"
+                    )
 
-        # 8. FRESH post-state probes (H0.6.1: never copy from pre-state).
+        # 9. FRESH post-state probes (H0.6.1: never copy from pre-state).
         post_state = _fresh_post_state(pre_state)
 
-        # 9. Verify production.
+        # 10. Verify production.
         prod_was_listening = next(
             (l.listening for l in pre_state.listeners if l.port == 18079), False,
         )
@@ -539,7 +628,8 @@ def run_lifecycle(
         if outcome == Outcome.PASS:
             unexpected_owners = [
                 o for o in post_state.get("foreign_owners", [])
-                if o.get("pid") not in (allowed_pids or ()) and o.get("pid") not in (pre_stop_pids or set())
+                if o.get("pid") not in (allowed_pids or ())
+                and o.get("pid") not in (pre_stop_pids or set())
             ]
             if unexpected_owners:
                 outcome = Outcome.FAIL
@@ -554,7 +644,7 @@ def run_lifecycle(
     audit = _finalize_audit(
         outcome, reason, pre_state,
         services_to_restart, foreign_owners,
-        candidate_pid, candidate_exit, timed_out, restoration,
+        candidate_pid, candidate_pgid, candidate_exit, timed_out, restoration,
         _fresh_post_state(pre_state), start,
     )
     write_audit(
@@ -566,12 +656,14 @@ def run_lifecycle(
             "foreign_owners": [dataclasses.asdict(o) for o in foreign_owners],
             "services_stopped": [e.service for e in services_to_restart],
             "timed_out": timed_out,
+            "candidate_pgid": candidate_pgid,
         },
         experiment_id=experiment_id,
         candidate_pid=candidate_pid,
         candidate_exit=candidate_exit,
         restoration=restoration or RestorationRecord(
-            candidate_pid=candidate_pid, candidate_killed=False,
+            candidate_pid=candidate_pid, candidate_pgid=candidate_pgid,
+            candidate_killed=False,
             services_restarted=[], restored_at_utc=utc_now(),
             post_state_restored=False,
         ),
@@ -585,7 +677,8 @@ def _finalize_audit(
     outcome: Outcome, reason: str, pre_state: PreStateSnapshot,
     owners_stopped: list[ServiceEvent],
     foreign_owners: list[ProcessGpuOwner],
-    candidate_pid: Optional[int], candidate_exit: Optional[int],
+    candidate_pid: Optional[int], candidate_pgid: Optional[int],
+    candidate_exit: Optional[int],
     timed_out: bool, restoration: Optional[RestorationRecord],
     post_state_fresh: dict, start: float,
 ) -> LifecycleAudit:
@@ -594,6 +687,7 @@ def _finalize_audit(
         owners_stopped=owners_stopped,
         foreign_owners_at_acquire=foreign_owners,
         candidate_pid=candidate_pid,
+        candidate_pgid=candidate_pgid,
         candidate_exit=candidate_exit,
         timed_out=timed_out,
         restoration=restoration,

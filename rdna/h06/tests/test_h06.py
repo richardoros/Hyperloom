@@ -526,13 +526,35 @@ class TestRunLifecycle:
         monkeypatch.setattr(orchestrator, "is_active", lambda name: False)
         monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
 
-        def slow(ctx):
-            ctx.register_candidate_pid(7777)
-            time.sleep(5)
+        # Process-based TIMEOUT (H0.6.2): the callable's subprocess
+        # times out, returns exit_code=137 (SIGKILL), and the
+        # orchestrator classifies it as TIMEOUT when the caller also
+        # requested a deadline.
+        def slow_subprocess(ctx):
             from h06.orchestrator import MeasurementResult
-            return MeasurementResult(exit_code=0, candidate_pid=7777)
+            import subprocess, os, signal
+            proc = subprocess.Popen(
+                ["sleep", "5"], start_new_session=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            ctx.register_candidate_pid(proc.pid)
+            try:
+                ctx.register_candidate_pgid(os.getpgid(proc.pid))
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                r = proc.communicate(timeout=0.05)
+                return MeasurementResult(exit_code=r.returncode, candidate_pid=proc.pid)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+                return MeasurementResult(
+                    exit_code=137, candidate_pid=proc.pid, timed_out=True,
+                )
         audit = run_lifecycle(
-            measurement=slow,
+            measurement=slow_subprocess,
             experiment_id=6,
             artifact_dir=tmp_path,
             snapshot_override=snap,
@@ -540,11 +562,8 @@ class TestRunLifecycle:
         )
         assert audit.outcome == Outcome.TIMEOUT
         assert audit.timed_out is True
-        # The exact language may change; just assert that it's a TIMEOUT-shaped message.
-        assert "did not complete within" in audit.reason
-        # The candidate PID was registered before sleep started, so the
-        # orchestrator owns it on timeout.
-        assert audit.candidate_pid == 7777
+        assert "SIGKILL" in audit.reason or "137" in audit.reason
+        assert audit.candidate_pid is not None and audit.candidate_pid > 0
 
     def test_production_dropped_proves_fail(self, tmp_path, monkeypatch):
         snap = self._fake_snapshot()

@@ -389,7 +389,30 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if cmd == "bench":
         port, model, result_file = rest[0], rest[1], rest[2]
-        return run_completion(int(port), model, result_file)
+        # H0.6.2: fixture path positional arg 4. Empty = DEFAULT_FIXTURE
+        # (back-compat) — but real H0.5 callers MUST pass an explicit
+        # path so the audit records the fixture's SHA.
+        fixture_path = rest[3] if len(rest) > 3 else ""
+        if not fixture_path:
+            fixture = DEFAULT_FIXTURE
+            fixture_audit_note = "default"
+        else:
+            fixture = load_fixture(fixture_path)
+            fixture_audit_note = f"path={fixture_path}"
+        # Cross-check the fixture's stored model_sha against the
+        # actual model's SHA-256 (computed here once). Fail closed
+        # on mismatch — the measurement is NOT an H0.5 baseline if
+        # the fixture was generated against a different GGUF.
+        model_sha = None
+        try:
+            if os.path.exists(model) and not os.path.isdir(model):
+                model_sha = hashlib.sha256(open(model, "rb").read()).hexdigest()
+        except OSError:
+            model_sha = None
+        return run_completion(
+            port=int(port), model=model, result_file=result_file,
+            fixture=fixture, model_sha256=model_sha,
+        )
     if cmd == "fail-payload":
         model, result_file, msg = rest[0], rest[1], rest[2]
         _persist(result_file, fail_payload(model, [msg]))

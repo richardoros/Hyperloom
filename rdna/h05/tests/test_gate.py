@@ -151,6 +151,10 @@ class TestGateRequiredBytes:
         monkeypatch.setattr("rdna.h05.gate._gpu_temp_c", lambda gpu_type: 50.0)
         monkeypatch.setattr("rdna.h05.gate._gpu_clock_mhz", lambda gpu_type: 2500)
         monkeypatch.setattr("rdna.h05.gate._build_contention", lambda: [])
+        # Production 18079 is genuinely up on the test host; mock the
+        # listener probe so the test isn't environment-dependent.
+        monkeypatch.setattr("rdna.h05.gate._is_listening",
+                           lambda port, host="127.0.0.1": False)
         import socket
         s = socket.socket()
         try:
@@ -165,8 +169,6 @@ class TestGateRequiredBytes:
             required_bytes=1 * 1024 * 1024 * 1024,
         )
         assert report.ok is True
-        # P1.7: headroom_fraction is post-load free fraction.
-        # free=24GiB, required=1GiB, total=25GiB → (24-1)/25 = 23/25 = 0.92
         assert report.headroom_fraction > 0.9
         # And it's NOT (free / total) which would be 24/25 = 0.96
         assert report.headroom_fraction < (24 * 1024**3) / (25 * 1024**3)

@@ -25,6 +25,9 @@ LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/home/homelabserver/src/llama.cpp-turboqua
 MEASURE_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/measure.py"
 SERVER_LOG="$RESULT_DIR/server.log"
 EXTRA_ARGS_FILE="$RESULT_DIR/extra_args.nul"
+# H0.6.2: exact-token fixture path. Empty = DEFAULT_FIXTURE (back-compat),
+# but the orchestrator MUST pass an explicit path for real measurements.
+FIXTURE_PATH="${FIXTURE_PATH:-}"
 
 mkdir -p "$RESULT_DIR"
 
@@ -100,6 +103,6 @@ done
 curl -sf -m 2 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 \
   || fail "server did not become healthy on port $PORT within 240s (see $SERVER_LOG)"
 
-python3 "$MEASURE_PY" bench "$PORT" "$MODEL" "$RESULT_DIR/$RESULT_FILENAME.json" \
+python3 "$MEASURE_PY" bench "$PORT" "$MODEL" "$RESULT_DIR/$RESULT_FILENAME.json" "$FIXTURE_PATH" \
   || fail "bench subcommand failed"
 exit 0
