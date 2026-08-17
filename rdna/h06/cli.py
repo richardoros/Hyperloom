@@ -29,6 +29,7 @@ The lifecycle audit artifact lands in
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -99,11 +100,15 @@ def _h05_baseline(ctx: MeasurementContext) -> MeasurementResult:
     inside a NEW process group (start_new_session=True). The candidate
     llama-server + its driver threads are descendants of that group;
     the orchestrator's RestoreTrap will SIGTERM/SIGKILL the entire
-    PGID on exit / signal / timeout / exception. With an explicit
-    NUMERIC-TOKEN fixture path the measurement is replayable.
+    PGID on exit / signal / timeout / exception.
 
-    The H0.5 measurement record is persisted into the per-run
-    workspace under rdna/h05_results/<experiment_id>/.
+    H0.6.2 (C2): the exact-token fixture path is REQUIRED. There is
+    no fallback to DEFAULT_FIXTURE (string prompt) here — that
+    fallback produced non-reproducible numbers. The orchestrator's
+    operator runs
+    ``python -m rdna.bench.measure generate_fixture PORT OUTPUT`` once
+    against the production llama-server and persists
+    ``rdna/h05/fixtures/<name>.json``.
     """
     import os
     import shutil
@@ -112,27 +117,34 @@ def _h05_baseline(ctx: MeasurementContext) -> MeasurementResult:
     import time
     from pathlib import Path
 
+    fixture_path = os.environ.get("HYPERLOOM_FIXTURE_PATH", "").strip()
+    if not fixture_path:
+        # H0.6.2 (C2): the bench/CLI returns a non-zero exit code so
+        # the orchestrator classifies the run as FAIL. The trap still
+        # restores services; the lifecycle audit records the reason.
+        raise RuntimeError(
+            "h05_baseline requires HYPERLOOM_FIXTURE_PATH pointing at "
+            "a persisted numeric exact-token fixture; run "
+            "'python -m rdna.bench.measure generate_fixture' against "
+            "the production llama-server and pass --fixture-path"
+        )
+    p = Path(fixture_path)
+    if not p.is_file():
+        raise RuntimeError(f"fixture not found: {fixture_path}")
+    try:
+        fixture_obj = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"fixture not parseable: {fixture_path}: {exc!r}")
+    if not fixture_obj.get("prompt_tokens"):
+        raise RuntimeError(
+            f"fixture {fixture_path} has no prompt_tokens; cannot "
+            "issue a real H0.5 baseline"
+        )
+
     repo_root = Path(__file__).resolve().parents[2]
     work_dir = repo_root / "rdna" / "h05_results" / f"experiment_{ctx.experiment_id}_h06_baseline"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Fixture: explicit path first; otherwise DEFAULT_FIXTURE. The
-    # orchestrator MUST pass an explicit path for H0.5 to be
-    # scientifically repeatable; falling back to DEFAULT_FIXTURE is
-    # a back-compat path that the bench CLI flags as not-a-real-baseline.
-    fixture_path = os.environ.get("HYPERLOOM_FIXTURE_PATH", "").strip()
-    if not fixture_path:
-        print(
-            json.dumps({
-                "warning": (
-                    "no --fixture-path supplied; bench CLI will fall back "
-                    "to DEFAULT_FIXTURE (string prompt). For an H0.5 "
-                    "reproducible baseline, run 'generate_fixture' against "
-                    "the production GGUF and pass --fixture-path."
-                ),
-            })
-        )
-        fixture_path = ""
     env = dict(os.environ)
     env.setdefault("HYPERLOOM_BYPASS_SCRIPTS_DIR", str(repo_root / "rdna" / "bench"))
     env.setdefault("FRAMEWORK_REPO_PATH", "/home/homelabserver/src/llama.cpp-turboquant")
@@ -189,6 +201,26 @@ def _h05_baseline(ctx: MeasurementContext) -> MeasurementResult:
         ctx.register_candidate_pgid(os.getpgid(proc.pid))
     except (OSError, ProcessLookupError):
         pass
+    # Audit fields — the operator can verify which exact fixture the
+    # run actually replayed.
+    fixture_sha = hashlib.sha256(
+        json.dumps(fixture_obj, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+    print(json.dumps({
+        "h05_baseline_audit": {
+            "experiment_id": ctx.experiment_id,
+            "fixture_path": fixture_path,
+            "fixture_sha_prefix": fixture_sha,
+            "fixture_model_sha256": fixture_obj.get("model_sha256"),
+            "fixture_prompt_tokens_count": len(fixture_obj.get("prompt_tokens", [])),
+            "fixture_n_predict": fixture_obj.get("n_predict"),
+            "fixture_seed": fixture_obj.get("seed"),
+            "fixture_temperature": fixture_obj.get("temperature"),
+            "candidate_pid": proc.pid,
+            "candidate_pgid": os.getpgid(proc.pid),
+            "deadline_seconds": deadline_s,
+        }
+    }))
 
     timed_out = False
     try:

@@ -319,9 +319,15 @@ def generate_fixture(
     import os as _os
 
     if _os.path.exists(model) and not _os.path.isdir(model):
-        # Compute model sha256 once and embed in the fixture.
+        # Chunked hashing (don't load the 20 GB GGUF into RAM).
+        h = hashlib.sha256()
         with open(model, "rb") as fh:
-            model_sha256 = hashlib.sha256(fh.read()).hexdigest()
+            while True:
+                buf = fh.read(1 << 20)  # 1 MiB
+                if not buf:
+                    break
+                h.update(buf)
+        model_sha256 = h.hexdigest()
     else:
         model_sha256 = "unknown-gguf"
     req = {
@@ -406,7 +412,15 @@ def main(argv: list[str] | None = None) -> int:
         model_sha = None
         try:
             if os.path.exists(model) and not os.path.isdir(model):
-                model_sha = hashlib.sha256(open(model, "rb").read()).hexdigest()
+                # Chunked hashing (don't load the 20 GB GGUF into RAM).
+                h = hashlib.sha256()
+                with open(model, "rb") as fh:
+                    while True:
+                        buf = fh.read(1 << 20)  # 1 MiB
+                        if not buf:
+                            break
+                        h.update(buf)
+                model_sha = h.hexdigest()
         except OSError:
             model_sha = None
         return run_completion(

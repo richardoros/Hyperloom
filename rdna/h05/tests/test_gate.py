@@ -13,6 +13,18 @@ from rdna.h05.gate import (
 from rdna.h05.identity import IdentityBlock
 
 
+# Monkey-patch helpers for gate tests.
+def _mute_extra_signals(monkeypatch):
+    monkeypatch.setattr("rdna.h05.gate._swap_io_rate",
+                       lambda *, sample_seconds=1.0: (0.0, 0.0))
+    monkeypatch.setattr("rdna.h05.gate._celery_cpu_percent",
+                       lambda *, sample_seconds=1.0: 0.0)
+    monkeypatch.setattr("rdna.h05.gate._swap_used_bytes", lambda: 0)
+    monkeypatch.setattr("rdna.h05.gate._gpu_temp_c", lambda gpu_type: 50.0)
+    monkeypatch.setattr("rdna.h05.gate._gpu_clock_mhz", lambda gpu_type: 2500)
+    monkeypatch.setattr("rdna.h05.gate._build_contention", lambda: [])
+
+
 def _identity() -> IdentityBlock:
     return IdentityBlock(
         source_repo="/src", source_sha="abc", binary_path="/b", binary_sha256="x",
@@ -125,9 +137,13 @@ class TestGateRequiredBytes:
         monkeypatch.setattr("rdna.h05.gate._cpu_load_per_core", lambda: 0.1)
         monkeypatch.setattr("rdna.h05.gate._ram_free_bytes", lambda: 64 * 1024**3)
         monkeypatch.setattr("rdna.h05.gate._swap_used_bytes", lambda: 0)
+        monkeypatch.setattr("rdna.h05.gate._swap_io_rate",
+                           lambda *, sample_seconds=1.0: (0.0, 0.0))
         monkeypatch.setattr("rdna.h05.gate._gpu_temp_c", lambda gpu_type: 50.0)
         monkeypatch.setattr("rdna.h05.gate._gpu_clock_mhz", lambda gpu_type: 2500)
         monkeypatch.setattr("rdna.h05.gate._build_contention", lambda: [])
+        monkeypatch.setattr("rdna.h05.gate._celery_cpu_percent",
+                           lambda *, sample_seconds=1.0: 0.0)
         ib = _identity()
         report = gate(
             identity=ib,
@@ -148,9 +164,13 @@ class TestGateRequiredBytes:
         monkeypatch.setattr("rdna.h05.gate._cpu_load_per_core", lambda: 0.1)
         monkeypatch.setattr("rdna.h05.gate._ram_free_bytes", lambda: 64 * 1024**3)
         monkeypatch.setattr("rdna.h05.gate._swap_used_bytes", lambda: 0)
+        monkeypatch.setattr("rdna.h05.gate._swap_io_rate",
+                           lambda *, sample_seconds=1.0: (0.0, 0.0))
         monkeypatch.setattr("rdna.h05.gate._gpu_temp_c", lambda gpu_type: 50.0)
         monkeypatch.setattr("rdna.h05.gate._gpu_clock_mhz", lambda gpu_type: 2500)
         monkeypatch.setattr("rdna.h05.gate._build_contention", lambda: [])
+        monkeypatch.setattr("rdna.h05.gate._celery_cpu_percent",
+                           lambda *, sample_seconds=1.0: 0.0)
         # Production 18079 is genuinely up on the test host; mock the
         # listener probe so the test isn't environment-dependent.
         monkeypatch.setattr("rdna.h05.gate._is_listening",
@@ -187,6 +207,7 @@ class TestGateExtraLoadSignals:
         monkeypatch.setattr("rdna.h05.gate._gpu_temp_c", lambda gpu_type: 50.0)
         monkeypatch.setattr("rdna.h05.gate._gpu_clock_mhz", lambda gpu_type: 2500)
         monkeypatch.setattr("rdna.h05.gate._build_contention", lambda: [])
+        _mute_extra_signals(monkeypatch)
         import socket
         s = socket.socket()
         try:
@@ -205,12 +226,8 @@ class TestGateExtraLoadSignals:
         monkeypatch.setattr("rdna.h05.gate._qwen38_state", lambda: "inactive")
         monkeypatch.setattr("rdna.h05.gate._foreign_llama_servers",
                            lambda *, gpu_type, foreign_owners_on_gpu=None, gpu_uuid=None: [])
-        monkeypatch.setattr("rdna.h05.gate._cpu_load_per_core", lambda: 0.1)
-        monkeypatch.setattr("rdna.h05.gate._ram_free_bytes", lambda: 64 * 1024**3)
-        monkeypatch.setattr("rdna.h05.gate._swap_used_bytes", lambda: 0)
-        monkeypatch.setattr("rdna.h05.gate._gpu_temp_c", lambda gpu_type: 50.0)
+        _mute_extra_signals(monkeypatch)
         monkeypatch.setattr("rdna.h05.gate._gpu_clock_mhz", lambda gpu_type: 200)  # power-saving
-        monkeypatch.setattr("rdna.h05.gate._build_contention", lambda: [])
         import socket
         s = socket.socket()
         try:
@@ -229,12 +246,8 @@ class TestGateExtraLoadSignals:
         monkeypatch.setattr("rdna.h05.gate._qwen38_state", lambda: "inactive")
         monkeypatch.setattr("rdna.h05.gate._foreign_llama_servers",
                            lambda *, gpu_type, foreign_owners_on_gpu=None, gpu_uuid=None: [])
-        monkeypatch.setattr("rdna.h05.gate._cpu_load_per_core", lambda: 0.1)
-        monkeypatch.setattr("rdna.h05.gate._ram_free_bytes", lambda: 64 * 1024**3)
-        monkeypatch.setattr("rdna.h05.gate._swap_used_bytes", lambda: 0)
+        _mute_extra_signals(monkeypatch)
         monkeypatch.setattr("rdna.h05.gate._gpu_temp_c", lambda gpu_type: 95.0)  # thermal
-        monkeypatch.setattr("rdna.h05.gate._gpu_clock_mhz", lambda gpu_type: 2500)
-        monkeypatch.setattr("rdna.h05.gate._build_contention", lambda: [])
         import socket
         s = socket.socket()
         try:
@@ -272,9 +285,13 @@ class TestGateBlockedRecordsToDB:
         monkeypatch.setattr("rdna.h05.gate._cpu_load_per_core", lambda: 0.1)
         monkeypatch.setattr("rdna.h05.gate._ram_free_bytes", lambda: 64 * 1024**3)
         monkeypatch.setattr("rdna.h05.gate._swap_used_bytes", lambda: 0)
+        monkeypatch.setattr("rdna.h05.gate._swap_io_rate",
+                           lambda *, sample_seconds=1.0: (0.0, 0.0))
         monkeypatch.setattr("rdna.h05.gate._gpu_temp_c", lambda gpu_type: 50.0)
         monkeypatch.setattr("rdna.h05.gate._gpu_clock_mhz", lambda gpu_type: 2500)
         monkeypatch.setattr("rdna.h05.gate._build_contention", lambda: [])
+        monkeypatch.setattr("rdna.h05.gate._celery_cpu_percent",
+                           lambda *, sample_seconds=1.0: 0.0)
 
         ib = _identity()
         with ExperimentDB(tmp_path / "experiments.db") as db:

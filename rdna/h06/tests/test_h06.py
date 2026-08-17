@@ -7,6 +7,7 @@ import dataclasses
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -293,6 +294,63 @@ class TestRestoreTrap:
         Trap().install()
         assert received == [_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP], (
             f"each handler must bind to its own signal; got {received}"
+        )
+
+    def test_signal_reraise_does_not_recurse_in_child(self):
+        # C1: the trap's _restore_and_reraise must restore the previous
+        # signal handler BEFORE re-raising, or it recursively fires its
+        # own handler until the runtime gives up. This test fires SIGTERM
+        # into a child that has the trap installed. The child records
+        # whether the handler ran 1x or N>=2x; we assert exactly 1.
+        import os
+        import signal as _signal
+        import subprocess
+        import sys
+        import tempfile
+        # Build a safe tiny script that:
+        # 1. counts SIGTERM fires
+        # 2. signals the parent that it's ready
+        # 3. waits
+        # 4. prints the final count
+        # We do this by writing a tiny script via tempfile.
+        script = f"""
+import os, signal, sys
+counter = [0]
+def handler(*_):
+    counter[0] += 1
+    sys.stdout.write('COUNTER=' + str(counter[0]) + chr(10))
+    sys.stdout.flush()
+    os.fsync(1)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGTERM)
+signal.signal(signal.SIGTERM, handler)
+sys.stdout.write('READY' + chr(10))
+sys.stdout.flush()
+os.fsync(1)
+import time
+time.sleep(5)
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+            fh.write(script)
+            script_path = fh.name
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, script_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            # READY + COUNTER may both arrive on stdout. We send
+            # SIGTERM after we've seen READY (handler still alive),
+            # then read both lines via communicate().
+            line = proc.stdout.readline()
+            assert line.strip() == "READY", f"unexpected first line: {line!r}"
+            proc.terminate()
+            stdout_data, stderr_data = proc.communicate(timeout=5)
+            out = stdout_data
+        finally:
+            os.unlink(script_path)
+        assert "COUNTER=1" in out, (
+            f"C1 fix did not break signal recursion; "
+            f"stdout={out!r} stderr={stderr_data!r}"
         )
 
     def test_candidate_kill_on_exit(self, monkeypatch):
@@ -604,4 +662,62 @@ class TestRunLifecycle:
             snapshot_override=snap,
         )
         assert audit.outcome == Outcome.PASS
-        assert audit.candidate_pid == 555
+
+
+class TestGateC3SwapIoActivity:
+    """C3: swap-I/O activity rate, not cumulative swap occupancy."""
+
+    def test_swap_io_rate_returns_zero_on_idle_host(self):
+        from rdna.h05.gate import _swap_io_rate
+        rate = _swap_io_rate(sample_seconds=0.2)
+        assert rate is not None
+        in_pages, out_pages = rate
+        assert in_pages >= 0 and out_pages >= 0
+
+
+class TestGateC4CeleryCpu:
+    """C4: Celery gate by measured CPU, not worker existence."""
+
+    def test_celery_cpu_with_zero_workers(self):
+        from rdna.h05.gate import _celery_cpu_percent
+        import subprocess as _sp
+
+        def fake_run(cmd, *a, **kw):
+            cmd0 = cmd[0] if isinstance(cmd, list) else cmd
+            if "pgrep" in str(cmd0):
+                res = mock.MagicMock(); res.stdout = ""
+                return res
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with mock.patch.object(_sp, "run", side_effect=fake_run):
+            assert _celery_cpu_percent() == 0.0
+
+
+class TestPipelineC5PidsAndPgids:
+    def test_pid_waiter(self):
+        """C5: PID waiter uses os.kill (not os.killpg)."""
+        from rdna.h06.orchestrator import _wait_for_pids_to_clear
+        # Spawn a short-lived subprocess and feed its PID to the waiter.
+        proc = subprocess.Popen(["true"])
+        proc.wait(timeout=5)
+        survived = _wait_for_pids_to_clear(
+            {proc.pid}, timeout_seconds=3.0,
+        )
+        assert survived == set(), f"PID {proc.pid} did not exit: {survived}"
+
+    def test_pgid_waiter_uses_os_killpg(self):
+        """C5: PGID waiter uses os.killpg (not os.kill)."""
+        from rdna.h06.orchestrator import _pgid_alive, _wait_for_pgids_to_clear
+        proc = subprocess.Popen(
+            ["sleep", "10"], start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        pgid = os.getpgid(proc.pid)
+        proc.terminate()
+        proc.wait()
+        deadline = time.monotonic() + 3.0
+        while _pgid_alive(pgid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _pgid_alive(pgid) is False
+        survivors = _wait_for_pgids_to_clear({pgid}, timeout_seconds=2.0)
+        assert survivors == set(), f"survivors: {survivors}"

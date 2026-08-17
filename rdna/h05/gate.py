@@ -21,7 +21,9 @@ import dataclasses
 import json
 import socket
 import subprocess
+import time
 from pathlib import Path
+from typing import Optional
 
 from .identity import IdentityBlock, detect_gpu_type
 
@@ -45,10 +47,14 @@ class GateReport:
     # P1.6 extra load signals.
     cpu_load_per_core: float | None
     ram_free_bytes: int | None
-    swap_used_bytes: int | None
+    swap_used_bytes: int | None  # telemetry only (see _swap_io_rate)
+    swap_io_in_pages_per_sec: float | None
+    swap_io_out_pages_per_sec: float | None
     gpu_temp_c: float | None
     gpu_clock_mhz: int | None
     contended_build: list[str]
+    # C4: Celery measured CPU (rather than mere worker existence).
+    celery_cpu_percent: float | None
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self), indent=2)
@@ -204,6 +210,16 @@ def _ram_free_bytes() -> int | None:
 
 
 def _swap_used_bytes() -> int | None:
+    """Cached for telemetry only; NOT a contention gate.
+
+    The previous version of this gate subtracted ``SwapFree`` from
+    ``SwapTotal`` and BLOCKED on swap > 64 MiB. That measures *residence*
+    (how much swap has accumulated in the past hours/days), not
+    paging activity *during* the benchmark. A long-idle host can
+    have 4 GiB resident in swap and zero paging during a 60-second
+    measurement. Use ``_swap_io_pages()`` + ``_swap_io_rate()`` for
+    the gate signal; this function is kept for telemetry only.
+    """
     try:
         total = used = 0
         for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
@@ -214,6 +230,55 @@ def _swap_used_bytes() -> int | None:
         return used
     except (OSError, ValueError):
         return None
+
+
+def _swap_io_pages() -> Optional[tuple[int, int]]:
+    """Return (pswpin, pswpout) cumulative counts from ``/proc/vmstat``.
+
+    These cumulative counters increase when the kernel pages IN from
+    swap or OUT to swap. The rate of change (over a short sample
+    window) is the actual contention signal; see
+    ``_swap_io_rate``.
+    """
+    try:
+        text = Path("/proc/vmstat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    pswpin = pswpout = None
+    for line in text.splitlines():
+        if line.startswith("pswpin "):
+            try:
+                pswpin = int(line.split()[1])
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("pswpout "):
+            try:
+                pswpout = int(line.split()[1])
+            except (ValueError, IndexError):
+                pass
+    if pswpin is None or pswpout is None:
+        return None
+    return pswpin, pswpout
+
+
+def _swap_io_rate(*, sample_seconds: float = 1.0) -> Optional[tuple[int, int]]:
+    """Sample swap-in / swap-out rates over a short interval.
+
+    Returns ((Δpswpin / Δt), (Δpswpout / Δt)) in pages/second. The
+    gate rejects a run when either rate exceeds a noise threshold
+    (default 50 pages/s). On an idle host the rate is typically 0.
+    """
+    t0 = time.monotonic()
+    a = _swap_io_pages()
+    if a is None:
+        return None
+    time.sleep(sample_seconds)
+    b = _swap_io_pages()
+    t1 = time.monotonic()
+    if b is None:
+        return None
+    dt = max(t1 - t0, 1e-6)
+    return max(0, (b[0] - a[0]) / dt), max(0, (b[1] - a[1]) / dt)
 
 
 def _gpu_temp_c(gpu_type: str) -> float | None:
@@ -278,9 +343,10 @@ def _gpu_clock_mhz(gpu_type: str) -> int | None:
 
 
 def _build_contention() -> list[str]:
-    """Detect build/Celery contention: heavy CPU users in build dirs OR celery workers.
+    """Detect BUILD-process contention only (C4: Celery moved to CPU measurement).
 
-    Returns a list of short reasons for the gate's failure message.
+    Heavy-build detection: processes in build dirs that are actively
+    compiling right now. Celery presence alone no longer counts.
     """
     reasons: list[str] = []
     try:
@@ -293,17 +359,86 @@ def _build_contention() -> list[str]:
     except (OSError, subprocess.TimeoutExpired):
         return reasons
     heavy_build = 0
-    celery = 0
     for line in ps.stdout.splitlines():
         if "/build" in line and "/compile" in line:
             heavy_build += 1
-        if "celery" in line and "worker" in line:
-            celery += 1
     if heavy_build > 0:
         reasons.append(f"{heavy_build} active compile process(es)")
-    if celery > 0:
-        reasons.append(f"{celery} celery worker(s) running")
     return reasons
+
+
+def _celery_cpu_percent(*, sample_seconds: float = 1.0) -> Optional[float]:
+    """Sum the CPU% of all processes matching ``celery ... worker`` over
+    a 1-second sample.
+
+    C4: the previous version counted Celery workers and BLOCKED on
+    ``count > 0``. JustApply ships a fleet of Celery workers that
+    sit idle (0% CPU) most of the time; that is NOT a contention
+    signal. The gate now samples actual CPU consumption across all
+    Celery workers. JustApply's fleet is tolerated when it is not
+    burning CPU.
+
+    Returns the sum of ``%CPU`` across matching processes (via
+    ``ps -p <pid> -o %cpu=`` averaged across the sample window), or
+    None if Celery processes could not be enumerated.
+    """
+    try:
+        ps = subprocess.run(
+            ["pgrep", "-af", "celery.*worker"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if not ps.stdout.strip():
+        return 0.0  # Celery never run; 0% by definition
+    pids: list[int] = []
+    for line in ps.stdout.splitlines():
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        try:
+            pids.append(int(parts[0]))
+        except ValueError:
+            continue
+    if not pids:
+        return 0.0
+    # Sample top -b -n2 to get %CPU per pid; sum. ``top`` reports the
+    # % across one second by default; the sample window keeps it
+    # bounded.
+    try:
+        out = subprocess.run(
+            ["top", "-b", "-n2", "-d", str(max(0.5, sample_seconds)),
+             "-p", ",".join(str(p) for p in pids)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    totals: dict[int, float] = {p: 0.0 for p in pids}
+    samples_per_pid: dict[int, int] = {p: 0 for p in pids}
+    current_pid: Optional[int] = None
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        # top -b lines look like: "  PID USER      PR  NI    VIRT    RES   SHR S  %CPU  %MEM     TIME+ COMMAND"
+        # then "  1234 user ..." rows.
+        parts = line.split()
+        if len(parts) < 10 or not parts[0].isdigit():
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid not in totals:
+            continue
+        try:
+            cpu = float(parts[8])
+        except (ValueError, IndexError):
+            continue
+        totals[pid] += cpu
+        samples_per_pid[pid] += 1
+    if not samples_per_pid or not any(samples_per_pid.values()):
+        return None
+    averages = [totals[p] / samples_per_pid[p] for p in pids if samples_per_pid[p] > 0]
+    return sum(averages)
 
 
 def _vram_rocm_smi() -> tuple[int, int]:
@@ -346,9 +481,10 @@ def gate(
     gpu_uuid: str | None = None,
     max_cpu_load_per_core: float = 0.85,
     min_free_ram_bytes: int = 4 * 1024 * 1024 * 1024,
-    max_swap_used_bytes: int = 64 * 1024 * 1024,
     max_gpu_temp_c: float = 90.0,
     min_gpu_clock_mhz: int = 500,
+    max_swap_io_pages_per_sec: float = 50.0,
+    max_celery_cpu_percent: float = 25.0,
 ) -> GateReport:
     """Run the fail-closed gate.
 
@@ -369,9 +505,12 @@ def gate(
         max_cpu_load_per_core: Per-core load above which the host is
             considered build/Celery-contended and BLOCKED.
         min_free_ram_bytes: Free RAM floor for system-side headroom.
-        max_swap_used_bytes: Swap activity ceiling.
+        max_swap_io_pages_per_sec: C3 — block on swap-I/O ACTIVITY (rate),
+            NOT on cumulative swap occupancy.
         max_gpu_temp_c:   GPU temperature ceiling (clocks throttle above this).
         min_gpu_clock_mhz: Minimum GPU clock (lower = power-saving = noise).
+        max_celery_cpu_percent: C4 — block on Celery CPU consumption,
+            not on mere Celery-worker existence (a JustApply fleet).
     """
     used, total = _vram_rocm_smi()
     free = max(0, total - used)
@@ -389,10 +528,16 @@ def gate(
     )
     cpu_load = _cpu_load_per_core()
     ram_free = _ram_free_bytes()
-    swap_used = _swap_used_bytes()
+    swap_used = _swap_used_bytes()  # telemetry only (C3)
+    swap_io = _swap_io_rate(sample_seconds=1.0)
+    if swap_io is None:
+        swap_io_in = swap_io_out = None
+    else:
+        swap_io_in, swap_io_out = swap_io
     gpu_temp = _gpu_temp_c(identity.gpu_type)
     gpu_clock = _gpu_clock_mhz(identity.gpu_type)
     contended_build = _build_contention()
+    celery_cpu = _celery_cpu_percent()
 
     ok = True
     reasons: list[str] = []
@@ -431,10 +576,17 @@ def gate(
         reasons.append(
             f"RAM free {ram_free // (1024*1024)} MiB < required {min_free_ram_bytes // (1024*1024)} MiB"
         )
-    if swap_used is not None and swap_used > max_swap_used_bytes:
+    if swap_io_in is not None and swap_io_in > max_swap_io_pages_per_sec:
         ok = False
         reasons.append(
-            f"swap activity {swap_used // (1024*1024)} MiB > {max_swap_used_bytes // (1024*1024)} MiB"
+            f"swap-in paging {swap_io_in:.1f} pages/s > {max_swap_io_pages_per_sec:.1f} pages/s "
+            "(swap-I/O activity too high)"
+        )
+    if swap_io_out is not None and swap_io_out > max_swap_io_pages_per_sec:
+        ok = False
+        reasons.append(
+            f"swap-out paging {swap_io_out:.1f} pages/s > {max_swap_io_pages_per_sec:.1f} pages/s "
+            "(swap-I/O activity too high)"
         )
     if gpu_temp is not None and gpu_temp > max_gpu_temp_c:
         ok = False
@@ -446,9 +598,18 @@ def gate(
         reasons.append(
             f"GPU clock {gpu_clock} MHz < {min_gpu_clock_mhz} MHz (governor=power-saving)"
         )
+    if celery_cpu is not None and celery_cpu > max_celery_cpu_percent:
+        ok = False
+        reasons.append(
+            f"Celery workers consuming {celery_cpu:.1f}% CPU > {max_celery_cpu_percent:.1f}% "
+            "(JustApply fleet is actively burning CPU — defer the run)"
+        )
     if contended_build:
         ok = False
-        reasons.append(f"build/Celery contention detected: {', '.join(contended_build)}")
+        reasons.append(
+            f"build contended: {', '.join(contended_build)} (excluding Celery; "
+            "Celery CPU is reported separately above)"
+        )
 
     return GateReport(
         ok=ok,
@@ -466,7 +627,10 @@ def gate(
         cpu_load_per_core=cpu_load,
         ram_free_bytes=ram_free,
         swap_used_bytes=swap_used,
+        swap_io_in_pages_per_sec=swap_io_in,
+        swap_io_out_pages_per_sec=swap_io_out,
         gpu_temp_c=gpu_temp,
         gpu_clock_mhz=gpu_clock,
         contended_build=contended_build,
+        celery_cpu_percent=celery_cpu,
     )

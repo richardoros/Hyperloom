@@ -266,10 +266,60 @@ def _wait_for_pids_to_clear(
 ) -> set[int]:
     """Wait (briefly) for each PID to terminate; return the survivors.
 
+    Uses ``os.kill(pid, 0)`` which is the correct primitive for a PID
+    (not ``os.killpg`` — that operates on process-group IDs).
+
     Polls at 0.2s intervals up to ``timeout_seconds``. Returns the set
     of PIDs that have not exited by the deadline — those still consume
     VRAM and may need manual intervention.
     """
+    return _alive_after_deadline(
+        probe=lambda p: _pid_alive(p),
+        pids=pids,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _pgid_alive(pgid: int) -> bool:
+    """Check process-group existence via ``os.killpg(pgid, 0)``.
+
+    C5: a PGID is not necessarily a PID — usually a new session's PGID
+    equals its leader PID but calling ``os.kill`` on a PGID treats it
+    as if it were a PID and gets ESRCH for valid groups, which is
+    misleading. Use ``os.killpg``.
+    """
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _wait_for_pgids_to_clear(
+    pgids: set[int], *, timeout_seconds: float = 10.0
+) -> set[int]:
+    """PGID companion to :func:`_wait_for_pids_to_clear` (C5)."""
+    return _alive_after_deadline(
+        probe=lambda p: _pgid_alive(p),
+        pids=pgids,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _alive_after_deadline(
+    *,
+    probe: Callable[[int], bool],
+    pids: set[int],
+    timeout_seconds: float,
+) -> set[int]:
     survivors: set[int] = set()
     deadline = time.monotonic() + timeout_seconds
     remaining = set(pids)
@@ -277,8 +327,8 @@ def _wait_for_pids_to_clear(
         still_alive: set[int] = set()
         for pid in remaining:
             try:
-                os.kill(pid, 0)
-                still_alive.add(pid)
+                if probe(pid):
+                    still_alive.add(pid)
             except (OSError, ProcessLookupError):
                 pass
         if not still_alive:
@@ -437,11 +487,15 @@ def run_lifecycle(
             _drain_allowlist_pre(allowlist)
         )
 
-        # 4. Wait briefly for the pre-stop PIDs / PGIDs to clear.
-        survivors = _wait_for_pids_to_clear(
-            pre_stop_pids | pre_stop_pgids,
-            timeout_seconds=drain_wait_seconds,
+        # 4. Wait briefly for pre-stop PIDs AND PGIDs to clear. C5
+        #    uses the right primitive for each (os.kill vs. os.killpg).
+        survivors_p = _wait_for_pids_to_clear(
+            pre_stop_pids, timeout_seconds=drain_wait_seconds,
         )
+        survivors_g = _wait_for_pgids_to_clear(
+            pre_stop_pgids, timeout_seconds=drain_wait_seconds,
+        )
+        survivors = survivors_p | survivors_g
         if survivors:
             outcome = Outcome.BLOCKED
             reason = (

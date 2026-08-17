@@ -183,9 +183,26 @@ class RestoreTrap:
                 pass
 
     def _restore_and_reraise(self, sig: int) -> None:
-        """Restore + re-raise the original signal."""
+        """Restore, restore the previous handler, THEN re-raise.
+
+        Restoring the previous signal handler BEFORE ``os.kill`` is
+        what breaks the recursion: without it, ``os.kill(self, sig)``
+        re-fires this handler, which re-raises, which re-installs this
+        handler's recursion indefinitely (C1 fix).
+
+        Without the previous-handler restoration the trap becomes
+        unsafe under any signal — the process cannot exit cleanly
+        because every re-raise re-enters us.
+        """
         self._run_restore()
-        # Re-raise.
+        # Restore the previous handler for ``sig`` before re-raising so
+        # the kernel's signal disposition matches what Python saw on
+        # __enter__.
+        previous = self._previous_handlers.get(sig, signal.SIG_DFL)
+        try:
+            signal.signal(sig, previous)
+        except (ValueError, OSError):
+            pass
         os.kill(os.getpid(), sig)
 
     def _kill_candidate(self) -> bool:
