@@ -26,6 +26,9 @@ _GFX_TO_RUNNER: dict[str, str] = {
     # the arch a runner is reached by is a deliberate choice, not an inverse.
     "gfx942": "mi300x",
     "gfx950": "mi355x",
+    # RDNA3 boards dispatch to their own runner label (rdna fork).
+    "gfx1100": "gfx1100",
+    "gfx1150": "gfx1150",
 }
 
 #: Re-exported from ``hyperloom.common`` so provenance and this module cannot
