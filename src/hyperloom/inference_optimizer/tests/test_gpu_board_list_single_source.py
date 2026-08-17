@@ -14,7 +14,9 @@ from __future__ import annotations
 from hyperloom.common.gpu_identity import AMD_GPU_DISPATCH_IDENTITIES
 from hyperloom.inference_optimizer.gpu_types import (
     _AMD_GPU_TYPES,
+    _PRODUCT_ALIASES,
     _PRODUCT_TAGS,
+    _TAG_TO_GPU_TYPE,
     amd_gpu_dispatch_identity,
 )
 
@@ -53,7 +55,14 @@ def test_every_listed_board_actually_resolves():
 
 
 def test_product_tags_cover_the_same_boards():
-    assert set(_PRODUCT_TAGS) == {b.upper() for b in AMD_GPU_DISPATCH_IDENTITIES}
+    """Every board maps to exactly one rocm-smi tag, and vice versa.
+
+    Boards in ``_PRODUCT_ALIASES`` use their product name verbatim; the
+    rest use the uppercased gpu_type key. The bidirectional equality
+    catches both "missing tag" and "orphan tag" regressions.
+    """
+    expected = {_PRODUCT_ALIASES.get(b, b.upper()) for b in AMD_GPU_DISPATCH_IDENTITIES}
+    assert set(_PRODUCT_TAGS) == expected
 
 
 def test_the_preflight_warning_names_the_boards_the_cli_accepts(capsys, monkeypatch):

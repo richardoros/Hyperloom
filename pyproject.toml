@@ -216,6 +216,7 @@ asyncio_mode = "auto"
 testpaths = [
     "src/hyperloom/**/tests",
     "scripts/tests",
+    "rdna/tests",
 ]
 pythonpath = ["src", "."]
 markers = [

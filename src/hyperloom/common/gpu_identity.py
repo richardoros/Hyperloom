@@ -20,10 +20,12 @@ AMD_GPU_DISPATCH_IDENTITIES: dict[str, tuple[str, int]] = {
     "mi308x": ("gfx942", 304),
     "mi325x": ("gfx942", 304),
     "mi355x": ("gfx950", 256),
-    # RDNA3 consumer boards (rdna fork): RX 7900 XTX is gfx1100 / 96 CU;
-    # Strix Point iGPU (Radeon 890M) is gfx1150 / 16 CU.
-    "gfx1100": ("gfx1100", 96),
-    "gfx1150": ("gfx1150", 16),
+    # RDNA3 consumer boards (rdna fork): the board is the gpu_type key,
+    # the gfx arch + CU count is the dispatch tuple. Keeping the arch out
+    # of the key means the CLI --gpu-type names a real product (the
+    # operator buys an RX 7900 XTX, not a gfx1100).
+    "rx7900xtx": ("gfx1100", 96),
+    "radeon890m": ("gfx1150", 16),
 }
 
 

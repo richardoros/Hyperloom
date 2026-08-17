@@ -14,9 +14,30 @@ from hyperloom.common.gpu_identity import AMD_GPU_DISPATCH_IDENTITIES
 #: let a board have a dispatch identity that ``_resolve_amd_gpu_type`` refused.
 _AMD_GPU_TYPES = frozenset(AMD_GPU_DISPATCH_IDENTITIES)
 
-#: rocm-smi product tags, reverse-sorted so a longer tag is tested before any
-#: tag that is a prefix of it -- an "MI300XL" must not be claimed by "MI300X".
-_PRODUCT_TAGS: tuple[str, ...] = tuple(sorted((t.upper() for t in _AMD_GPU_TYPES), reverse=True))
+#: rocm-smi product names that differ from the uppercased gpu_type key.
+#: The consumer boards print their product name (e.g. "RX 7900 XTX", with
+#: spaces) rather than the bare arch key. Keyed by gpu_type so the per-board
+#: rocm-smi probe stays a single joined table.
+_PRODUCT_ALIASES: dict[str, str] = {
+    "rx7900xtx": "RX 7900 XTX",
+    "radeon890m": "RADEON 890M",
+}
+
+#: Reverse-sorted rocm-smi product tags. Datacenter boards use the
+#: uppercased gpu_type key verbatim; consumer boards use their alias.
+#: A longer tag is tested before any tag that it prefixes -- an "MI300XL"
+#: must not be claimed by "MI300X".
+_PRODUCT_TAGS: tuple[str, ...] = tuple(
+    sorted(
+        (_PRODUCT_ALIASES.get(t, t.upper()) for t in _AMD_GPU_TYPES),
+        reverse=True,
+    )
+)
+
+#: Reverse of ``_PRODUCT_TAGS`` for the rocm-smi probe.
+_TAG_TO_GPU_TYPE: dict[str, str] = {
+    _PRODUCT_ALIASES.get(t, t.upper()): t for t in _AMD_GPU_TYPES
+}
 
 _GFX_TO_RUNNER: dict[str, str] = {
     # gfx arch -> Magpie runner label, so launchers and runtime materializers
@@ -27,8 +48,8 @@ _GFX_TO_RUNNER: dict[str, str] = {
     "gfx942": "mi300x",
     "gfx950": "mi355x",
     # RDNA3 boards dispatch to their own runner label (rdna fork).
-    "gfx1100": "gfx1100",
-    "gfx1150": "gfx1150",
+    "gfx1100": "rx7900xtx",
+    "gfx1150": "radeon890m",
 }
 
 #: Re-exported from ``hyperloom.common`` so provenance and this module cannot
@@ -62,7 +83,7 @@ def _resolve_gpu_type(
 
 
 def _autodetect_gpu_type() -> str | None:
-    """Return mi300x|mi308x|mi325x|mi355x or None if undetectable."""
+    """Return mi300x|mi308x|mi325x|mi355x|rx7900xtx|radeon890m or None."""
     import subprocess
 
     try:
@@ -74,7 +95,7 @@ def _autodetect_gpu_type() -> str | None:
         ).stdout.upper()
         for tag in _PRODUCT_TAGS:
             if tag in out:
-                return tag.lower()
+                return _TAG_TO_GPU_TYPE[tag]
     except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError, OSError):
         # rocm-smi missing / slow / not permitted; fall through to the torch
         # gcnArchName probe below (autodetect is best-effort).

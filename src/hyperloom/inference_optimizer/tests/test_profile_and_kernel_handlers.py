@@ -88,7 +88,11 @@ def test_mi325x_keeps_real_gpu_type_but_uses_mi300x_runner(tmp_path, monkeypatch
     )
 
     assert cli_model_gate._gpu_runner_type("mi325x") == "mi300x"
-    assert cli_model_gate._GFX_TO_RUNNER.get("gfx1100") is None
+    # RDNA fork extends the gfx→runner map: gfx1100 dispatches to the
+    # rx7900xtx runner, gfx1150 to the radeon890m runner. The upstream
+    # assertion that gfx1100 is absent is no longer valid for this fork.
+    assert cli_model_gate._GFX_TO_RUNNER.get("gfx1100") == "rx7900xtx"
+    assert cli_model_gate._GFX_TO_RUNNER.get("gfx1150") == "radeon890m"
     manifest = build_manifest(tmp_path, args=args, session_id="mi325x-session")
     state = cli_bootstrap._seed_shared_state(
         tmp_path,

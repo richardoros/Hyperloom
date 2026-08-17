@@ -41,7 +41,7 @@ RX 7900 XTX (gfx1100, OCuLink eGPU) + Radeon 890M (gfx1150 iGPU).
 2. Inventory pass: llama-turboquant/, llama.cpp/, src/llama.cpp-turboquant/, models/.
 3. Production map: confirm 18079 service, GGUF SHA-256, exact llama-server flags.
 4. Wire framework=custom (per examples/hyperloom-custom-advanced/) to existing
-   llama.cpp bench script. Add gfx1100 identity.
+   llama.cpp bench script. Add rx7900xtx / radeon890m board identity.
 5. Lifecycle proof on 18179: launch -> measure -> terminate -> persist result.
 EXIT GATE: Hyperloom launches workload, measures, terminates, persists a result.
 

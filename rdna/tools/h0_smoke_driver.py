@@ -24,10 +24,18 @@ def main() -> int:
     output_dir = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path("/tmp/h0-run")
     output_dir.mkdir(parents=True, exist_ok=True)
     model = os.environ["MODEL"]
+    # The CLI publishes --framework-path / --benchmark-scripts-dir as env
+    # vars; mirror that here so the executor's resolve_scriptable_script
+    # finds rdna/bench/custom_<gpu-type>.sh. The driver-only env override
+    # keeps this script callable from a plain shell (no install.sh needed).
+    rdna_bench = REPO_ROOT / "rdna" / "bench"
+    os.environ.setdefault("HYPERLOOM_BYPASS_SCRIPTS_DIR", str(rdna_bench))
+    os.environ.setdefault("HYPERLOOM_BENCHMARK_BACKEND", "bypass")
+    os.environ.setdefault("FRAMEWORK_REPO_PATH", "/home/homelabserver/src/llama.cpp-turboquant")
     bench = {
         "framework": "custom",
         "model": model,
-        "runner_type": "gfx1100",
+        "runner_type": "rx7900xtx",
         "precision": "q5_k_xl",
         "profiler": {
             "torch_profiler": {"enabled": False},
@@ -37,6 +45,14 @@ def main() -> int:
         "envs": {},
         "timeout_seconds": 900,
     }
+    # PORT override lets the smoke run when 18179 is already in use by a
+    # unrelated development workload -- amendment 4 of the H0.0+ closure pass
+    # says we never touch a foreign process, but the script reads PORT
+    # from its env so an operator override is a legitimate experiment lane.
+    # The executor's build_scriptable_env reads `bench["envs"]`, not the
+    # bench_envs argument, so the override must land in the bench config.
+    if "PORT" in os.environ:
+        bench["envs"]["PORT"] = os.environ["PORT"]
     rc = _run_scriptable_benchmark(
         framework="custom",
         model=model,

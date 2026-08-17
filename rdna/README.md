@@ -12,7 +12,7 @@ terminate it, and persist a result, without touching the production service
   patch allowlist (specialists may only edit source there).
 - `--benchmark-scripts-dir` sets `HYPERLOOM_BYPASS_SCRIPTS_DIR`; the entrypoint
   is taken as `custom_<gpu-type>.sh`, or the single `.sh` in the directory.
-- The entrypoint is invoked as `bash custom_gfx1100.sh` with env: `MODEL`,
+- The entrypoint is invoked as `bash custom_rx7900xtx.sh` with env: `MODEL`,
   `RESULT_DIR`, `RESULT_FILENAME` (=`inferencex_result`), `RUNNER_TYPE`,
   plus anything `--extra-env` pins (pinned keys become part of the measurement
   contract; a variant may add keys but not overwrite pinned ones).
@@ -26,18 +26,34 @@ terminate it, and persist a result, without touching the production service
 
 ## Files
 
-- `bench/custom_gfx1100.sh` - benchmark entrypoint. Server flags default to the
-  production unit `qwen38-turboquant.service` (port 18079) but always bind the
-  experiment lane 18179. Overrides: `MODEL`, `PORT`, `LLAMA_SERVER_BIN`,
-  `EXTRA_CUSTOM_ARGS` (operator-pinned extra server flags).
+- `bench/custom_rx7900xtx.sh` - benchmark entrypoint. Server flags default to
+  the production unit `qwen38-turboquant.service` (port 18079) but always bind
+  the experiment lane 18179. Overrides: `MODEL`, `PORT`, `LLAMA_SERVER_BIN`,
+  `EXTRA_CUSTOM_ARGS` (operator-pinned extra server flags, shlex-parsed).
+- `bench/measure.py` - pure-python helpers used by the entrypoint:
+  `split_server_args` (shlex with quoted/escaped tokens and fail-closed on
+  unparseable input), `port_in_use` (TCP probe, fail-closed on foreign
+  listener before launch), `parse_timings` (buun-llama-cpp key names with
+  upstream llama.cpp fallback), `build_result` (success=quality_ok,
+  `mean_e2el_ms` = wall*1000, `prompt_eval_ms` separate, never labeled TTFT).
+- `tools/h0_smoke_driver.py` - smoke driver that calls the public
+  `_run_scriptable_benchmark` bypass executor. Run end-to-end through the
+  Hyperloom code path with one completion.
 
-## gfx1100 / gfx1150 identity
+## Board identity (rx7900xtx / radeon890m)
 
-Added to the dispatch tables so `--gpu-type gfx1100` is accepted and the
-runner label resolves for script lookup:
+The board name is the gpu_type key; the gfx arch + CU count is the dispatch
+tuple. Keeping the arch out of the key means the CLI `--gpu-type` names a
+real product (the operator buys an RX 7900 XTX, not a gfx1100).
 
-- `src/hyperloom/common/gpu_identity.py`: `gfx1100` (96 CU), `gfx1150` (16 CU).
-- `src/hyperloom/inference_optimizer/gpu_types.py`: `_GFX_TO_RUNNER` entries.
+- `src/hyperloom/common/gpu_identity.py`:
+  - `rx7900xtx -> (gfx1100, 96 CU)`
+  - `radeon890m -> (gfx1150, 16 CU)`
+- `src/hyperloom/inference_optimizer/gpu_types.py`:
+  - `_GFX_TO_RUNNER`: `gfx1100 -> rx7900xtx`, `gfx1150 -> radeon890m`.
+  - `_PRODUCT_ALIASES`: rocm-smi product names that differ from the
+    uppercased gpu_type key (`RX 7900 XTX`, `RADEON 890M`); autodetect
+    uses the joined `_TAG_TO_GPU_TYPE` map.
 
 ## Run
 
@@ -45,12 +61,14 @@ runner label resolves for script lookup:
 cd /home/homelabserver/hyperloom-rdna
 export MODEL=/home/homelabserver/models/Qwen3.8-27B-UD-Q5_K_XL.gguf
 mkdir -p /tmp/h0-run && cd /tmp/h0-run
-bash /home/homelabserver/hyperloom-rdna/rdna/bench/custom_gfx1100.sh
+bash /home/homelabserver/hyperloom-rdna/rdna/bench/custom_rx7900xtx.sh
 cat inferencex_result.json
 ```
 
 Produces: server.log (llama-server stdout), inferencex_result.json (flat
-report with quality_gate), and prints `pp=... tg=...` on success.
+report with quality_gate, `prompt_eval_ms` separate, `mean_e2el_ms` =
+wall*1000), `extra_args.nul` (evidence of shlex parsing), and prints
+`pp=... tg=... prompt_eval=... ms` on success.
 
 ## Production map (recorded 2026-08-17, H0.0)
 
