@@ -1,0 +1,1 @@
+"""H0.5 evaluator: pinned build, GGUF verify, repeated measurement, deterministic decision."""
