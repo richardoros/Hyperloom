@@ -649,9 +649,7 @@ class TestRunLifecycle:
                 returncode=0,
             )
         def _start(name, **kw):
-            import sys
             restart_calls.append(name)
-            print('  len=', len(restart_calls), '  id2=', id(restart_calls), file=sys.stderr)
             return allowlist.ServiceEvent(
                 service=name, action="start",
                 started_utc="2026-08-17T00:00:00Z",
@@ -660,14 +658,12 @@ class TestRunLifecycle:
             )
         monkeypatch.setattr(allowlist, "stop_service", _stop)
         monkeypatch.setattr(allowlist, "start_service", _start)
-        monkeypatch.setattr(allowlist, "start_service", _start)
         monkeypatch.setattr(restore_mod, "start_service", _start)
         monkeypatch.setattr(allowlist, "is_active", lambda name: name == "rdna-h05-build.service")
         monkeypatch.setattr(
             orchestrator, "_resolve_service_main_pid_and_pgid",
             lambda name: (12345, 12345) if name == "rdna-h05-build.service" else (None, None),
         )
-        monkeypatch.setattr(allowlist, "is_active", lambda name: name == "rdna-h05-build.service")
         monkeypatch.setattr(orchestrator, "_wait_for_pids_to_clear",
                             lambda pids, timeout_seconds: set())
         monkeypatch.setattr(orchestrator, "_wait_for_pgids_to_clear",

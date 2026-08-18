@@ -261,8 +261,8 @@ def _drain_allowlist_pre(
         if pgid is not None:
             pgids.add(pgid)
         reasons[name] = "stopped for exclusive-XTX window"
-        print('A', file=__import__('sys').stderr); evt = allowlist.stop_service(name); print('B', file=__import__('sys').stderr); print('evt=', repr(evt), file=__import__('sys').stderr)
-        print('about to record', file=__import__('sys').stderr); trap.record_stop_event(evt); print('after record, _stopped=', list(trap._stopped), file=__import__('sys').stderr)  # H0.6.3: trap owns the restart contract
+        evt = allowlist.stop_service(name)
+        trap.record_stop_event(evt)  # H0.6.3: trap owns the restart contract
     return pids, pgids, reasons
 
 
