@@ -652,59 +652,106 @@ def run_lifecycle(
                                         "candidate exited 0; post-state to be verified"
                                     )
 
-                        port_check = int(
-                            os.environ.get("HYPERLOOM_EXPERIMENT_PORT", "18180")
-                        )
-                        port_gone = _verify_port_closed(
-                            port=port_check, timeout_seconds=5.0
-                        )
-                        if (candidate_pgid is not None or candidate_pid is not None):
-                            post_kill_owners = (
-                                attribute_to_lab_gpu(
-                                    lab_gpu_bdf=effective_bdf,
-                                    lab_gpu_uuid=effective_uuid,
-                                    allowed_pids=set(allowed_pids) | pre_stop_pids,
-                                )
-                                if effective_bdf and effective_uuid
-                                else []
-                            )
-                            descendants = [
-                                o for o in post_kill_owners
-                                if o.pid not in set(allowed_pids) | pre_stop_pids
-                            ]
-                            if not port_gone and outcome == Outcome.PASS:
-                                outcome = Outcome.FAIL
-                                reason = f"{reason}; candidate port still listening"
-                            if descendants and outcome == Outcome.PASS:
-                                outcome = Outcome.FAIL
-                                reason = (
-                                    f"{reason}; {len(descendants)} descendant "
-                                    f"XTX owner(s) still on GPU"
-                                )
-
-            # H0.6.3 / 6.3.3: ONE authoritative post-state snapshot is
-            # captured AND used to verify restoration. The same
-            # dict is persisted into the audit; we don't take a
-            # second snapshot later (drift risk).
-            post_state = _fresh_post_state(pre_state)
+            # NOTE: candidate-port / descendants / fresh post-state are
+            # all captured AFTER the with-block exit, once the trap has
+            # killed the candidate and restarted the allowlisted
+            # services. Capturing them inside the with-block would
+            # observe mid-restoration state. (6.4.2, 6.4.3)
 
         # Capture the trap's restoration record AFTER the with-block
         # (the trap's record is populated in its __exit__).
         restoration = trap.record
-        # H0.6.3 / 6.3.3: derive post_state_restored from the same
-        # authoritative post_state we just captured.
-        post_state_restored = _is_post_state_restored(pre_state, post_state)
+
+        # 6.4.4: restarted services legitimately get fresh MainPIDs.
+        # Resolve them now so we can accept those PIDs as restored
+        # owners (not new foreign ones).
+        new_restarted_pids: set[int] = set()
+        if restoration is not None:
+            for evt in restoration.services_restarted:
+                pid, _ = _resolve_service_main_pid_and_pgid(evt.service)
+                if pid is not None:
+                    new_restarted_pids.add(pid)
+
+        # 6.4.3: candidate cleanup verification AFTER __exit__.
+        # The candidate PID was just killed by trap._run_restore; verify
+        # the experiment port is closed and no descendant XTX owners
+        # remain on the GPU.
+        port_check = int(
+            os.environ.get("HYPERLOOM_EXPERIMENT_PORT", "18180")
+        )
+        port_gone = _verify_port_closed(
+            port=port_check, timeout_seconds=5.0,
+        )
+        descendants: list = []
+        if candidate_pgid is not None or candidate_pid is not None:
+            if effective_bdf and effective_uuid:
+                post_kill_owners = attribute_to_lab_gpu(
+                    lab_gpu_bdf=effective_bdf,
+                    lab_gpu_uuid=effective_uuid,
+                    allowed_pids=set(allowed_pids) | pre_stop_pids | new_restarted_pids,
+                )
+            else:
+                post_kill_owners = []
+            descendants = [
+                o for o in post_kill_owners
+                if o.pid not in set(allowed_pids) | pre_stop_pids | new_restarted_pids
+            ]
+
+        # 6.4.2 / 6.4.10: ONE authoritative post-state snapshot is
+        # captured AFTER __exit__ and drives BOTH the comparison
+        # (_is_post_state_restored) and the audit. No second "fresh"
+        # snapshot later — drift risk.
+        post_state = _fresh_post_state(pre_state)
+
+        # 6.4.4: post_state_restored comparison accepts restarted-service
+        # PIDs as legitimate (churn handling).
+        post_state_restored = _is_post_state_restored(
+            pre_state, post_state, new_restarted_pids=new_restarted_pids,
+        )
         if restoration is not None:
             restoration = dataclasses.replace(
-                restoration, post_state_restored=post_state_restored
+                restoration, post_state_restored=post_state_restored,
             )
             candidate_pid = restoration.candidate_pid
             candidate_pgid = restoration.candidate_pgid
-        if outcome == Outcome.PASS and not (
-            restoration is not None and restoration.post_state_restored
-        ):
-            outcome = Outcome.FAIL
-            reason = "post_state_restored is False; check restoration.services_restarted vs pre_state"
+
+        # 6.4.11: restoration failure cannot yield PASS.
+        # Every restoration invariant below, if violated AND outcome
+        # is currently PASS, flips to FAIL with a precise reason.
+        if outcome == Outcome.PASS:
+            failure_reasons: list[str] = []
+            if not post_state_restored:
+                failure_reasons.append(
+                    "post_state_restored is False (pre != post)"
+                )
+            if not port_gone:
+                failure_reasons.append("candidate port still listening")
+            if descendants:
+                failure_reasons.append(
+                    f"{len(descendants)} descendant XTX owner(s) "
+                    f"still on GPU after trap exit"
+                )
+            if (
+                restoration is not None
+                and restoration.candidate_pid is not None
+                and not restoration.candidate_killed
+            ):
+                failure_reasons.append(
+                    f"candidate pid={restoration.candidate_pid} was not killed"
+                )
+            if restoration is not None:
+                for evt in restoration.services_restarted:
+                    if evt.returncode != 0:
+                        failure_reasons.append(
+                            f"service restart failed: "
+                            f"{evt.service} returncode={evt.returncode}"
+                        )
+            if failure_reasons:
+                outcome = Outcome.FAIL
+                reason = (
+                    "candidate exited 0; restoration failed: "
+                    + "; ".join(failure_reasons)
+                )
     finally:
         lock.release()
 
@@ -798,8 +845,10 @@ def _run_measurement_with_sigalrm(
 def _is_post_state_restored(
     pre_state: PreStateSnapshot,
     post_state: dict,
+    *,
+    new_restarted_pids: Optional[set[int]] = None,
 ) -> bool:
-    """H0.6.3 / 6.3.3: deterministic pre-vs-post comparison.
+    """H0.6.3 / 6.3.3 deterministic pre-vs-post comparison.
 
     Compares the captured pre_state against the freshly probed post_state.
     All four checks must pass for True:
@@ -807,7 +856,10 @@ def _is_post_state_restored(
     1. listeners dict matches (port -> listening).
     2. services dict matches (name -> is_active).
     3. production 18079 listening AND healthy if pre had it up.
-    4. no NEW foreign XTX owners appear (pre → post subset).
+    4. post_state foreign_owners are a subset of (pre_state foreign_owners
+       UNION new_restarted_pids). New PIDs from successfully-restarted
+       services are legitimate restored owners, not new foreign ones
+       (6.4.4 PID-churn handling).
     """
     if not post_state:
         return False
@@ -828,11 +880,14 @@ def _is_post_state_restored(
     )
     if pre_prod_listening and not post_state.get("production_health_ok"):
         return False
-    # H0.6.3 / 6.3.3: post_state.foreign_owners must be a SUBSET of
-    # pre_state.foreign_owners (no NEW XTX owners appeared).
+    # 6.4.4: post_state foreign_owners must be a subset of (pre-state
+    # owners UNION new-restarted-service PIDs). Restarted services
+    # legitimately get fresh MainPIDs; those are restored owners,
+    # not new foreign ones.
     pre_owners = {o.pid for o in pre_state.gpu_processes}
+    allowed_post_owners = pre_owners | (new_restarted_pids or set())
     post_owners = {o["pid"] for o in post_state.get("foreign_owners", [])}
-    if not post_owners.issubset(pre_owners):
+    if not post_owners.issubset(allowed_post_owners):
         return False
     return True
 
