@@ -866,6 +866,70 @@ class TestRunLifecycle:
         assert audit.outcome == Outcome.PASS
         assert audit.candidate_pid == 555
 
+    def test_stop_service_nonzero_blocks_drain(self, tmp_path, monkeypatch):
+        """6.4.9: stop_service returning non-zero must NOT be silently
+        treated as success. The orchestrator must fail-closed: BLOCK
+        and preserve the failure in audit evidence; services that DID
+        stop successfully before the failure must still be restarted
+        by the trap's __exit__.
+        """
+        snap = self._fake_snapshot()
+        self._patch_foreign_owners(monkeypatch, [])
+
+        stop_calls: list[str] = []
+        def fake_stop(name, **kw):
+            stop_calls.append(name)
+            # First call succeeds (returncode=0); second call fails.
+            rc = 0 if len(stop_calls) == 1 else 1
+            return allowlist.ServiceEvent(
+                service=name, action="stop",
+                started_utc="2026-08-17T00:00:00Z",
+                finished_utc="2026-08-17T00:00:00Z",
+                returncode=rc,
+            )
+        restart_calls: list[str] = []
+        def fake_start(name, **kw):
+            restart_calls.append(name)
+            return allowlist.ServiceEvent(
+                service=name, action="start",
+                started_utc="2026-08-17T00:00:00Z",
+                finished_utc="2026-08-17T00:00:00Z",
+                returncode=0,
+            )
+        monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
+        monkeypatch.setattr(allowlist, "stop_service", fake_stop)
+        monkeypatch.setattr(allowlist, "start_service", fake_start)
+        monkeypatch.setattr(restore_mod, "start_service", fake_start)
+        monkeypatch.setattr(allowlist, "is_active", lambda name: True)
+        monkeypatch.setattr(
+            orchestrator, "_resolve_service_main_pid_and_pgid",
+            lambda name: (12345, 12345) if "ok" in name else (12346, 12346),
+        )
+        monkeypatch.setattr(orchestrator, "_fresh_post_state",
+                            lambda s: self._fake_post_state(snap))
+
+        audit = run_lifecycle(
+            measurement=lambda ctx: self._quick_measurement(ctx),
+            experiment_id=99, artifact_dir=tmp_path, snapshot_override=snap,
+            allowlist=("foo-ok.service", "bar-fail.service"),
+        )
+        assert audit.outcome == Outcome.BLOCKED
+        assert "drain failed" in audit.reason.lower(), (
+            f"reason should mention drain failure; got {audit.reason!r}"
+        )
+        assert "bar-fail.service" in audit.reason
+        assert audit.candidate_pid is None, (
+            "no measurement should have run when drain failed"
+        )
+        # Both services were attempted.
+        assert stop_calls == ["foo-ok.service", "bar-fail.service"]
+        # foo-ok.service was successfully stopped, so the trap must
+        # restart it on __exit__.
+        assert "foo-ok.service" in restart_calls
+        # bar-fail.service stop FAILED, so the trap must NOT record it
+        # for restart (we never proved it stopped).
+        assert "bar-fail.service" not in restart_calls
+
 
 
 class TestGateC3SwapIoActivity:

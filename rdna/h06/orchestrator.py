@@ -262,8 +262,34 @@ def _drain_allowlist_pre(
             pgids.add(pgid)
         reasons[name] = "stopped for exclusive-XTX window"
         evt = allowlist.stop_service(name)
+        if evt.returncode != 0:
+            # 6.4.9: stop_service returning non-zero is a hard fail.
+            # Do NOT pretend the service was successfully drained and
+            # do NOT record it for restart (we never proved it stopped).
+            raise DrainStopFailed(
+                service=name,
+                returncode=evt.returncode,
+            )
         trap.record_stop_event(evt)  # H0.6.3: trap owns the restart contract
     return pids, pgids, reasons
+
+
+class DrainStopFailed(Exception):
+    """6.4.9: a systemd stop returned non-zero during the drain phase.
+
+    The orchestrator must not proceed to measurement when one of the
+    services we promised to drain was not actually drained. The active
+    ``RestoreTrap`` will still restart whichever services were
+    successfully stopped before this exception was raised.
+    """
+
+    def __init__(self, *, service: str, returncode: int) -> None:
+        self.service = service
+        self.returncode = returncode
+        super().__init__(
+            f"stop_service({service!r}) returned {returncode}; "
+            "service was NOT successfully stopped — drain failed"
+        )
 
 
 def _wait_for_pids_to_clear(
@@ -490,154 +516,171 @@ def run_lifecycle(
 
     try:
         with RestoreTrap(pre_state) as trap:
-            pre_stop_pids, pre_stop_pgids, _drain_reasons = (
-                _drain_allowlist_pre(services=allowlist, trap=trap)
-            )
-
-            survivors_p = _wait_for_pids_to_clear(
-                pre_stop_pids, timeout_seconds=drain_wait_seconds,
-            )
-            survivors_g = _wait_for_pgids_to_clear(
-                pre_stop_pgids, timeout_seconds=drain_wait_seconds,
-            )
-            survivors = survivors_p | survivors_g
-            if survivors:
+            drain_failed = False
+            try:
+                pre_stop_pids, pre_stop_pgids, _drain_reasons = (
+                    _drain_allowlist_pre(services=allowlist, trap=trap)
+                )
+            except DrainStopFailed as exc:
+                # 6.4.9: drain failed; the trap's __exit__ will still
+                # run and restart whatever was successfully stopped
+                # before this exception. We set BLOCKED and skip
+                # measurement entirely.
                 outcome = Outcome.BLOCKED
                 reason = (
-                    f"{len(survivors)} allowlisted service PID(s) survived "
-                    f"drain: {sorted(survivors)}; not safe to proceed"
+                    f"drain failed: stop_service({exc.service!r}) returned "
+                    f"{exc.returncode}; not safe to measure (other "
+                    f"services may be partially drained)"
                 )
-            else:
-                explicit_allowed = set(allowed_pids) | pre_stop_pids
-                if effective_bdf and effective_uuid:
-                    foreign_owners = attribute_to_lab_gpu(
-                        lab_gpu_bdf=effective_bdf,
-                        lab_gpu_uuid=effective_uuid,
-                        allowed_pids=explicit_allowed,
-                    )
-                unknown_owners = [
-                    o for o in foreign_owners if o.backend == "unknown"
-                ]
-                known_foreign = [
-                    o for o in foreign_owners if o.backend != "unknown"
-                ]
-                allowed_for_filter = set(allowed_pids) | pre_stop_pids
-                unknown_owners = [
-                    o for o in unknown_owners if o.pid not in allowed_for_filter
-                ]
-                known_foreign = [
-                    o for o in known_foreign if o.pid not in allowed_for_filter
-                ]
-                if unknown_owners:
+                pre_stop_pids = set()
+                pre_stop_pgids = set()
+                drain_failed = True
+
+            if not drain_failed:
+                survivors_p = _wait_for_pids_to_clear(
+                    pre_stop_pids, timeout_seconds=drain_wait_seconds,
+                )
+                survivors_g = _wait_for_pgids_to_clear(
+                    pre_stop_pgids, timeout_seconds=drain_wait_seconds,
+                )
+                survivors = survivors_p | survivors_g
+                if survivors:
                     outcome = Outcome.BLOCKED
                     reason = (
-                        f"{len(unknown_owners)} UNKNOWN XTX owner(s); their "
-                        "GPU attribution could not be resolved (CPU vs. GPU?). "
-                        "Operator must investigate before allowing H0.6 to "
-                        "attribute them."
-                    )
-                elif known_foreign:
-                    outcome = Outcome.BLOCKED
-                    reason = (
-                        f"{len(known_foreign)} foreign XTX owner(s) not in "
-                        "allowlist: must be killed or allowlisted explicitly."
+                        f"{len(survivors)} allowlisted service PID(s) survived "
+                        f"drain: {sorted(survivors)}; not safe to proceed"
                     )
                 else:
-                    ctx.register_candidate_pid = lambda pid: (
-                        trap.set_candidate_pid(pid)
-                    )
-                    ctx.register_candidate_pgid = lambda pgid: (
-                        trap.set_candidate_pgid(pgid)
-                    )
-                    ctx._deadline_seconds = timeout_seconds  # type: ignore[attr-defined]
-
-                    raw_result, error = _run_measurement_with_sigalrm(
-                        measurement=measurement,
-                        ctx=ctx,
-                        timeout_seconds=timeout_seconds,
-                    )
-
-                    if error is not None:
-                        candidate_exit = -1
-                        if (
-                            "deadline" in str(error).lower()
-                            or "timeout" in str(error).lower()
-                        ):
-                            timed_out = True
-                            outcome = Outcome.TIMEOUT
-                            reason = (
-                                f"measurement raised a timeout-shaped "
-                                f"error: {error!r}"
-                            )
-                        else:
-                            outcome = Outcome.FAIL
-                            reason = f"measurement raised: {error!r}"
-                    elif raw_result is None:
-                        candidate_exit = -1
-                        outcome = Outcome.FAIL
-                        reason = "measurement returned None"
+                    explicit_allowed = set(allowed_pids) | pre_stop_pids
+                    if effective_bdf and effective_uuid:
+                        foreign_owners = attribute_to_lab_gpu(
+                            lab_gpu_bdf=effective_bdf,
+                            lab_gpu_uuid=effective_uuid,
+                            allowed_pids=explicit_allowed,
+                        )
+                    unknown_owners = [
+                        o for o in foreign_owners if o.backend == "unknown"
+                    ]
+                    known_foreign = [
+                        o for o in foreign_owners if o.backend != "unknown"
+                    ]
+                    allowed_for_filter = set(allowed_pids) | pre_stop_pids
+                    unknown_owners = [
+                        o for o in unknown_owners if o.pid not in allowed_for_filter
+                    ]
+                    known_foreign = [
+                        o for o in known_foreign if o.pid not in allowed_for_filter
+                    ]
+                    if unknown_owners:
+                        outcome = Outcome.BLOCKED
+                        reason = (
+                            f"{len(unknown_owners)} UNKNOWN XTX owner(s); their "
+                            "GPU attribution could not be resolved (CPU vs. GPU?). "
+                            "Operator must investigate before allowing H0.6 to "
+                            "attribute them."
+                        )
+                    elif known_foreign:
+                        outcome = Outcome.BLOCKED
+                        reason = (
+                            f"{len(known_foreign)} foreign XTX owner(s) not in "
+                            "allowlist: must be killed or allowlisted explicitly."
+                        )
                     else:
-                        try:
-                            coerced = _coerce_measurement_result(raw_result)
-                        except TypeError as exc:
-                            candidate_exit = -2
-                            outcome = Outcome.FAIL
-                            reason = str(exc)
-                        else:
-                            candidate_exit = coerced.exit_code
-                            if coerced.candidate_pid is not None:
-                                candidate_pid = coerced.candidate_pid
+                        ctx.register_candidate_pid = lambda pid: (
+                            trap.set_candidate_pid(pid)
+                        )
+                        ctx.register_candidate_pgid = lambda pgid: (
+                            trap.set_candidate_pgid(pgid)
+                        )
+                        ctx._deadline_seconds = timeout_seconds  # type: ignore[attr-defined]
+
+                        raw_result, error = _run_measurement_with_sigalrm(
+                            measurement=measurement,
+                            ctx=ctx,
+                            timeout_seconds=timeout_seconds,
+                        )
+
+                        if error is not None:
+                            candidate_exit = -1
                             if (
-                                coerced.timed_out
-                                or (candidate_exit == 137 and timeout_seconds is not None)
+                                "deadline" in str(error).lower()
+                                or "timeout" in str(error).lower()
                             ):
                                 timed_out = True
                                 outcome = Outcome.TIMEOUT
                                 reason = (
-                                    f"candidate exited with SIGKILL (137) "
-                                    f"after {timeout_seconds:.0f}s deadline"
-                                )
-                            elif candidate_exit != 0:
-                                outcome = Outcome.FAIL
-                                reason = (
-                                    f"candidate exited with non-zero code "
-                                    f"{candidate_exit}"
+                                    f"measurement raised a timeout-shaped "
+                                    f"error: {error!r}"
                                 )
                             else:
-                                outcome = Outcome.PASS
-                                reason = (
-                                    "candidate exited 0; post-state to be verified"
-                                )
+                                outcome = Outcome.FAIL
+                                reason = f"measurement raised: {error!r}"
+                        elif raw_result is None:
+                            candidate_exit = -1
+                            outcome = Outcome.FAIL
+                            reason = "measurement returned None"
+                        else:
+                            try:
+                                coerced = _coerce_measurement_result(raw_result)
+                            except TypeError as exc:
+                                candidate_exit = -2
+                                outcome = Outcome.FAIL
+                                reason = str(exc)
+                            else:
+                                candidate_exit = coerced.exit_code
+                                if coerced.candidate_pid is not None:
+                                    candidate_pid = coerced.candidate_pid
+                                if (
+                                    coerced.timed_out
+                                    or (candidate_exit == 137 and timeout_seconds is not None)
+                                ):
+                                    timed_out = True
+                                    outcome = Outcome.TIMEOUT
+                                    reason = (
+                                        f"candidate exited with SIGKILL (137) "
+                                        f"after {timeout_seconds:.0f}s deadline"
+                                    )
+                                elif candidate_exit != 0:
+                                    outcome = Outcome.FAIL
+                                    reason = (
+                                        f"candidate exited with non-zero code "
+                                        f"{candidate_exit}"
+                                    )
+                                else:
+                                    outcome = Outcome.PASS
+                                    reason = (
+                                        "candidate exited 0; post-state to be verified"
+                                    )
 
-                    port_check = int(
-                        os.environ.get("HYPERLOOM_EXPERIMENT_PORT", "18180")
-                    )
-                    port_gone = _verify_port_closed(
-                        port=port_check, timeout_seconds=5.0
-                    )
-                    if (candidate_pgid is not None or candidate_pid is not None):
-                        post_kill_owners = (
-                            attribute_to_lab_gpu(
-                                lab_gpu_bdf=effective_bdf,
-                                lab_gpu_uuid=effective_uuid,
-                                allowed_pids=set(allowed_pids) | pre_stop_pids,
-                            )
-                            if effective_bdf and effective_uuid
-                            else []
+                        port_check = int(
+                            os.environ.get("HYPERLOOM_EXPERIMENT_PORT", "18180")
                         )
-                        descendants = [
-                            o for o in post_kill_owners
-                            if o.pid not in set(allowed_pids) | pre_stop_pids
-                        ]
-                        if not port_gone and outcome == Outcome.PASS:
-                            outcome = Outcome.FAIL
-                            reason = f"{reason}; candidate port still listening"
-                        if descendants and outcome == Outcome.PASS:
-                            outcome = Outcome.FAIL
-                            reason = (
-                                f"{reason}; {len(descendants)} descendant "
-                                f"XTX owner(s) still on GPU"
+                        port_gone = _verify_port_closed(
+                            port=port_check, timeout_seconds=5.0
+                        )
+                        if (candidate_pgid is not None or candidate_pid is not None):
+                            post_kill_owners = (
+                                attribute_to_lab_gpu(
+                                    lab_gpu_bdf=effective_bdf,
+                                    lab_gpu_uuid=effective_uuid,
+                                    allowed_pids=set(allowed_pids) | pre_stop_pids,
+                                )
+                                if effective_bdf and effective_uuid
+                                else []
                             )
+                            descendants = [
+                                o for o in post_kill_owners
+                                if o.pid not in set(allowed_pids) | pre_stop_pids
+                            ]
+                            if not port_gone and outcome == Outcome.PASS:
+                                outcome = Outcome.FAIL
+                                reason = f"{reason}; candidate port still listening"
+                            if descendants and outcome == Outcome.PASS:
+                                outcome = Outcome.FAIL
+                                reason = (
+                                    f"{reason}; {len(descendants)} descendant "
+                                    f"XTX owner(s) still on GPU"
+                                )
 
             # H0.6.3 / 6.3.3: ONE authoritative post-state snapshot is
             # captured AND used to verify restoration. The same
