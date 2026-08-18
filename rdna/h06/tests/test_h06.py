@@ -866,6 +866,127 @@ class TestRunLifecycle:
         assert audit.outcome == Outcome.PASS
         assert audit.candidate_pid == 555
 
+    def test_stateful_active_stopped_measurement_restarted_active_passes(
+        self, tmp_path, monkeypatch,
+    ):
+        """6.4.5: full lifecycle active -> stopped -> measurement ->
+        trap restart -> active -> post-state -> PASS.
+
+        Regression guard for 6.4.2: if _fresh_post_state() is moved
+        INSIDE the with-block again, this test fails because the mock
+        post-state reflects the mid-restoration 'foo.service is
+        INACTIVE' state (stop happened, restart hasn't yet) which
+        mismatches the pre-state 'foo.service is ACTIVE'.
+        """
+        snap = self._fake_snapshot()
+        snap = dataclasses.replace(
+            snap,
+            services=[
+                snap_mod.ServiceState(name="qwen38-turboquant.service",
+                                       is_active="inactive", is_enabled=False),
+                snap_mod.ServiceState(name="foo.service",
+                                       is_active="active", is_enabled=True),
+            ],
+        )
+        self._patch_foreign_owners(monkeypatch, [])
+
+        stop_calls: list[str] = []
+        start_calls: list[str] = []
+
+        def fake_stop(name, **kw):
+            stop_calls.append(name)
+            return allowlist.ServiceEvent(
+                service=name, action="stop",
+                started_utc="2026-08-17T00:00:00Z",
+                finished_utc="2026-08-17T00:00:00Z",
+                returncode=0,
+            )
+
+        def fake_start(name, **kw):
+            start_calls.append(name)
+            return allowlist.ServiceEvent(
+                service=name, action="start",
+                started_utc="2026-08-17T00:00:00Z",
+                finished_utc="2026-08-17T00:00:00Z",
+                returncode=0,
+            )
+
+        def fake_fresh_post_state(pre_state_arg):
+            # Reflect in-flight stop/restart ordering so a post_state
+            # captured INSIDE the trap (before __exit__'s start_service)
+            # reports foo.service as INACTIVE.
+            services_active = []
+            for s in pre_state_arg.services:
+                if (s.name == "foo.service"
+                        and "foo.service" in stop_calls
+                        and "foo.service" not in start_calls):
+                    services_active.append({
+                        "name": s.name, "is_active": "inactive",
+                        "is_enabled": s.is_enabled,
+                    })
+                else:
+                    services_active.append({
+                        "name": s.name, "is_active": s.is_active,
+                        "is_enabled": s.is_enabled,
+                    })
+            return {
+                "services": services_active,
+                "listeners": [
+                    {"port": l.port, "listening": l.listening, "process": l.process}
+                    for l in pre_state_arg.listeners
+                ],
+                "production_health_ok": pre_state_arg.production_health_ok,
+                "gpu_telemetry": {
+                    "vram_total_bytes": 0, "vram_used_bytes": 0,
+                    "vram_free_bytes": 0, "temperature_c": None,
+                    "sclk_mhz": None, "mclk_mhz": None,
+                    "utilization_pct": None,
+                },
+                "foreign_owners": [],
+                "captured_utc": "2026-08-17T00:00:00Z",
+            }
+
+        monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "h06.lock")
+        monkeypatch.setattr(allowlist, "stop_service", fake_stop)
+        monkeypatch.setattr(allowlist, "start_service", fake_start)
+        monkeypatch.setattr(restore_mod, "start_service", fake_start)
+        monkeypatch.setattr(allowlist, "is_active",
+                            lambda name: name == "foo.service")
+        monkeypatch.setattr(
+            orchestrator, "_resolve_service_main_pid_and_pgid",
+            lambda name: (12345, 12345) if name == "foo.service" else (None, None),
+        )
+        monkeypatch.setattr(orchestrator, "_fresh_post_state", fake_fresh_post_state)
+        monkeypatch.setattr(orchestrator, "_verify_port_closed",
+                            lambda *, port, timeout_seconds: True)
+        monkeypatch.setattr(orchestrator, "production_health_ok", lambda **kw: True)
+
+        audit = run_lifecycle(
+            measurement=lambda ctx: self._quick_measurement(
+                ctx, 0, candidate_pid=555,
+            ),
+            experiment_id=42, artifact_dir=tmp_path, snapshot_override=snap,
+            allowlist=("foo.service",),
+        )
+
+        assert audit.outcome == Outcome.PASS, (
+            f"full lifecycle (active -> stop -> measure -> restart -> "
+            f"active -> post-state) must PASS; got outcome={audit.outcome.value}, "
+            f"reason={audit.reason!r}"
+        )
+        assert audit.candidate_pid == 555
+        assert stop_calls == ["foo.service"], (
+            f"foo.service should have been stopped once; got {stop_calls!r}"
+        )
+        assert start_calls == ["foo.service"], (
+            f"foo.service should have been restarted once; got {start_calls!r}"
+        )
+        assert audit.restoration is not None
+        assert audit.restoration.post_state_restored is True, (
+            "post_state_restored must be True when the snapshot was "
+            "captured AFTER trap restart"
+        )
+
     def test_stop_service_nonzero_blocks_drain(self, tmp_path, monkeypatch):
         """6.4.9: stop_service returning non-zero must NOT be silently
         treated as success. The orchestrator must fail-closed: BLOCK
