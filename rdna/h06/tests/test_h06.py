@@ -359,62 +359,130 @@ class TestRestoreTrap:
         )
 
     @pytest.mark.flaky(reruns=3, reruns_delay=1)
-    def test_signal_reraise_does_not_recurse_in_child(self):
-        # C1: the trap's _restore_and_reraise must restore the previous
-        # signal handler BEFORE re-raising, or it recursively fires its
-        # own handler until the runtime gives up. This test fires SIGTERM
-        # into a child that has the trap installed. The child records
-        # whether the handler ran 1x or N>=2x; we assert exactly 1.
-        import os
-        import signal as _signal
+    def test_real_restore_trap_one_shot_sigterm(self, tmp_path):
+        # 6.4.7 / C1: child imports the REAL RestoreTrap, sends SIGTERM
+        # via the parent's proc.terminate(), and must exit cleanly.
+        # The trap must restore the previous signal handler BEFORE
+        # re-raising; otherwise the re-raise re-enters the handler and
+        # the process never terminates (C1 regression).
+        #
+        # The child patches restore_mod._kill_pid and
+        # restore_mod.start_service to log calls to a tempfile; the
+        # parent verifies:
+        #   - the trap's handler ran EXACTLY ONCE (one 'kill:' line)
+        #   - the restoration path ran (kill + start were called)
+        #   - the child exited from SIGTERM (not hung, not SIGKILL'd)
         import subprocess
-        import sys
-        import tempfile
-        # Build a safe tiny script that:
-        # 1. counts SIGTERM fires
-        # 2. signals the parent that it's ready
-        # 3. waits
-        # 4. prints the final count
-        # We do this by writing a tiny script via tempfile.
-        script = f"""
-import os, signal, sys
-counter = [0]
-def handler(*_):
-    counter[0] += 1
-    sys.stdout.write('COUNTER=' + str(counter[0]) + chr(10))
-    sys.stdout.flush()
-    os.fsync(1)
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    os.kill(os.getpid(), signal.SIGTERM)
-signal.signal(signal.SIGTERM, handler)
-sys.stdout.write('READY' + chr(10))
-sys.stdout.flush()
-os.fsync(1)
-import time
-time.sleep(5)
-"""
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
-            fh.write(script)
-            script_path = fh.name
+        import sys as _sys
+        import time as _time
+
+        log_path = tmp_path / "trap_log.txt"
+        script_path = tmp_path / "real_c1_child.py"
+        script = f'''
+import sys, os
+sys.path.insert(0, {repr(str(REPO / "rdna"))})
+
+from h06.snapshot import PreStateSnapshot, GpuTelemetry
+from h06.restore import RestoreTrap
+from h06 import restore as restore_mod
+from h06.allowlist import ServiceEvent
+
+LOG = {repr(str(log_path))}
+
+def _log(msg):
+    with open(LOG, "a") as f:
+        f.write(msg + "\\n")
+
+def fake_kill(pid, **kw):
+    _log(f"kill:{{pid}}")
+    return True
+
+def fake_start(name, **kw):
+    _log(f"start:{{name}}")
+    return ServiceEvent(
+        service=name, action="start",
+        started_utc="2026-08-17T00:00:00Z",
+        finished_utc="2026-08-17T00:00:00Z",
+        returncode=0,
+    )
+
+restore_mod._kill_pid = fake_kill
+restore_mod.start_service = fake_start
+
+snap = PreStateSnapshot(
+    captured_utc="2026-08-17T00:00:00Z",
+    lab_gpu=None, gpu_processes=[],
+    gpu_telemetry=GpuTelemetry(
+        vram_total_bytes=0, vram_used_bytes=0, vram_free_bytes=0,
+        temperature_c=None, sclk_mhz=None, mclk_mhz=None, utilization_pct=None,
+    ),
+    services=[], listeners=[],
+    production_health_ok=False,
+)
+
+print("READY", flush=True)
+
+with RestoreTrap(snap, candidate_pid=99999, services_to_restart=None) as trap:
+    import time as _t
+    _t.sleep(5)
+    print("TRAP_NEVER_FIRED", flush=True)
+    _sys.exit(2)
+'''
+        script_path.write_text(script)
         try:
             proc = subprocess.Popen(
-                [sys.executable, script_path],
+                [_sys.executable, str(script_path)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-            # READY + COUNTER may both arrive on stdout. We send
-            # SIGTERM after we've seen READY (handler still alive),
-            # then read both lines via communicate().
             line = proc.stdout.readline()
-            assert line.strip() == "READY", f"unexpected first line: {line!r}"
-            proc.terminate()
-            stdout_data, stderr_data = proc.communicate(timeout=5)
-            out = stdout_data
+            assert line.strip() == "READY", (
+                f"unexpected first line: {line!r}, stderr={proc.stderr.read()!r}"
+            )
+            start = _time.monotonic()
+            proc.terminate()  # sends SIGTERM
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                pytest.fail(
+                    f"child did not exit after SIGTERM; recursion suspected. "
+                    f"stdout={proc.stdout.read()!r}, stderr={proc.stderr.read()!r}"
+                )
+            elapsed = _time.monotonic() - start
+            stdout_remainder = proc.stdout.read()
+            stderr_data = proc.stderr.read()
+
+            # Child should exit from SIGTERM (signal-terminated). On
+            # Unix, subprocess returncode is -SIGTERM = -15.
+            assert proc.returncode == -15, (
+                f"child did not exit from SIGTERM; returncode={proc.returncode}, "
+                f"elapsed={elapsed:.2f}s. stdout={stdout_remainder!r}, "
+                f"stderr={stderr_data!r}"
+            )
+            assert elapsed < 3.0, (
+                f"child took {elapsed:.2f}s to exit; signal recursion suspected"
+            )
+            assert "TRAP_NEVER_FIRED" not in stdout_remainder, (
+                f"trap did not fire; child exited via normal path. "
+                f"stdout={stdout_remainder!r}"
+            )
+
+            # Restoration path ran.
+            log = log_path.read_text()
+            assert "kill:99999" in log, (
+                f"trap did not call _kill_pid; restoration path did not run. "
+                f"log:\n{log}"
+            )
+            # The handler ran EXACTLY ONCE: only one 'kill:' line.
+            kill_lines = [ln for ln in log.splitlines() if ln.startswith("kill:")]
+            assert len(kill_lines) == 1, (
+                f"trap handler ran {len(kill_lines)} times (expected 1); "
+                f"signal recursion suspected. log:\n{log}"
+            )
         finally:
-            os.unlink(script_path)
-        assert "COUNTER=1" in out, (
-            f"C1 fix did not break signal recursion; "
-            f"stdout={out!r} stderr={stderr_data!r}"
-        )
+            if script_path.exists():
+                script_path.unlink()
 
     def test_candidate_kill_on_exit(self, monkeypatch):
         # Pretend we launched candidate PID 55555; kill succeeds.
