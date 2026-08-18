@@ -260,6 +260,48 @@ class TestGateExtraLoadSignals:
         assert report.ok is False
         assert "temperature" in report.reason.lower()
 
+    def test_blocks_on_celery_cpu_none(self, monkeypatch):
+        # 6.4.6: when _celery_cpu_percent returns None (e.g. /proc read
+        # failure), the gate must fail-closed. The current code's check
+        # 'if celery_cpu is not None and celery_cpu > max' lets None
+        # skip the gate — that's the bug.
+        monkeypatch.setattr("rdna.h05.gate._vram_rocm_smi",
+                            lambda: (1 * 1024**3, 25 * 1024**3))
+        monkeypatch.setattr("rdna.h05.gate._qwen38_state", lambda: "inactive")
+        monkeypatch.setattr("rdna.h05.gate._foreign_llama_servers",
+                           lambda *, gpu_type, foreign_owners_on_gpu=None, gpu_uuid=None: [])
+        monkeypatch.setattr("rdna.h05.gate._cpu_load_per_core", lambda: 0.1)
+        monkeypatch.setattr("rdna.h05.gate._ram_free_bytes", lambda: 64 * 1024**3)
+        monkeypatch.setattr("rdna.h05.gate._swap_used_bytes", lambda: 0)
+        monkeypatch.setattr("rdna.h05.gate._swap_io_rate",
+                           lambda *, sample_seconds=1.0: (0.0, 0.0))
+        monkeypatch.setattr("rdna.h05.gate._gpu_temp_c", lambda gpu_type: 50.0)
+        monkeypatch.setattr("rdna.h05.gate._gpu_clock_mhz", lambda gpu_type: 2500)
+        monkeypatch.setattr("rdna.h05.gate._build_contention", lambda: [])
+        # Celery CPU measurement failed (/proc unreadable).
+        monkeypatch.setattr("rdna.h05.gate._celery_cpu_percent",
+                           lambda *, sample_seconds=1.0: None)
+        # No production port listening on test host.
+        monkeypatch.setattr("rdna.h05.gate._is_listening",
+                           lambda port, host="127.0.0.1": False)
+        import socket
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            free_port = s.getsockname()[1]
+        finally:
+            s.close()
+        ib = _identity()
+        report = gate(identity=ib, exp_port=free_port, required_bytes=1 * 1024**3)
+        assert report.ok is False, (
+            f"gate must fail-closed on celery_cpu=None; got ok=True, "
+            f"reason={report.reason!r}"
+        )
+        assert "celery" in report.reason.lower(), (
+            f"reason should mention celery; got {report.reason!r}"
+        )
+        assert report.celery_cpu_percent is None
+
 
 class TestGateBlockedRecordsToDB:
     """P0.1: BLOCKED attempts must be persisted (regression test).

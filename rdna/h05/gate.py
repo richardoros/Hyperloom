@@ -618,7 +618,17 @@ def gate(
         reasons.append(
             f"GPU clock {gpu_clock} MHz < {min_gpu_clock_mhz} MHz (governor=power-saving)"
         )
-    if celery_cpu is not None and celery_cpu > max_celery_cpu_percent:
+    if celery_cpu is None:
+        # 6.4.6: telemetry returned None (e.g. /proc read failure).
+        # _celery_cpu_percent's docstring promises "fail-closed at the
+        # gate"; treat None as BLOCK (cannot prove Celery is not
+        # burning CPU).
+        ok = False
+        reasons.append(
+            "celery telemetry returned None (could not read /proc); "
+            "fail-closed: cannot prove Celery is not burning CPU"
+        )
+    elif celery_cpu > max_celery_cpu_percent:
         ok = False
         reasons.append(
             f"Celery workers consuming {celery_cpu:.1f}% CPU > {max_celery_cpu_percent:.1f}% "
