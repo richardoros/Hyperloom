@@ -50,7 +50,7 @@ def _systemctl(*args: str, timeout: float = 60.0) -> tuple[int, str]:
 
 def stop_service(name: str, *, timeout: float = 60.0) -> ServiceEvent:
     started = utc_now()
-    rc, _ = _systemctl(["stop", name], timeout=timeout)
+    rc, _ = _systemctl("stop", name, timeout=timeout)
     return ServiceEvent(
         service=name, action="stop",
         started_utc=started, finished_utc=utc_now(), returncode=rc,
@@ -59,7 +59,7 @@ def stop_service(name: str, *, timeout: float = 60.0) -> ServiceEvent:
 
 def start_service(name: str, *, timeout: float = 60.0) -> ServiceEvent:
     started = utc_now()
-    rc, _ = _systemctl(["start", name], timeout=timeout)
+    rc, _ = _systemctl("start", name, timeout=timeout)
     return ServiceEvent(
         service=name, action="start",
         started_utc=started, finished_utc=utc_now(), returncode=rc,
@@ -67,7 +67,7 @@ def start_service(name: str, *, timeout: float = 60.0) -> ServiceEvent:
 
 
 def is_active(name: str, *, timeout: float = 5.0) -> bool:
-    rc, _ = _systemctl(["is-active", name], timeout=timeout)
+    rc, _ = _systemctl("is-active", name, timeout=timeout)
     return rc == 0
 
 

@@ -259,6 +259,68 @@ class TestAllowlist:
         assert evt.action == "stop"
         assert evt.returncode == 0
 
+    def test_stop_service_passes_flat_argv(self, monkeypatch):
+        # 6.4.8: stop_service must build ['systemctl', 'stop', name]
+        # (flat), never the nested ['systemctl', ['stop', name]] form
+        # that 9f162ad3's signature change was supposed to eliminate.
+        import subprocess
+        captured: list[list] = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, *a, **kw):
+            captured.append(list(cmd))
+            return _FakeCompleted()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        allowlist.stop_service("foo.service")
+        assert captured == [["systemctl", "stop", "foo.service"]], (
+            f"argv was nested/wrong: {captured}"
+        )
+
+    def test_start_service_passes_flat_argv(self, monkeypatch):
+        # 6.4.8: start_service sibling regression.
+        import subprocess
+        captured: list[list] = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, *a, **kw):
+            captured.append(list(cmd))
+            return _FakeCompleted()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        allowlist.start_service("bar.service")
+        assert captured == [["systemctl", "start", "bar.service"]], (
+            f"argv was nested/wrong: {captured}"
+        )
+
+    def test_is_active_passes_flat_argv(self, monkeypatch):
+        # 6.4.8: is_active sibling regression.
+        import subprocess
+        captured: list[list] = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, *a, **kw):
+            captured.append(list(cmd))
+            return _FakeCompleted()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        allowlist.is_active("baz.service")
+        assert captured == [["systemctl", "is-active", "baz.service"]], (
+            f"argv was nested/wrong: {captured}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # restore.py
