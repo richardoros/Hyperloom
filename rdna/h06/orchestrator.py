@@ -74,6 +74,7 @@ from .allowlist import DEFAULT_ALLOWLIST, ServiceEvent
 # These are module-qualified: functions use allowlist.is_active etc. so
 # tests can patch allowlist.is_active and the call still resolves.
 from .lock import LOCK_PATH, ExperimentLock
+from . import ownership
 from .ownership import ProcessGpuOwner, attribute_to_lab_gpu
 from .restore import RestorationRecord, RestoreTrap, write_audit
 from .snapshot import (

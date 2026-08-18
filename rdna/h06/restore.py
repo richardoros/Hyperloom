@@ -258,7 +258,7 @@ class RestoreTrap:
         # drain path is handled correctly: services stopped before
         # the BLOCK condition was discovered are still restarted.
         for service_name in list(self._stopped):
-            print('  start_service call', file=__import__('sys').stderr); restart_events.append(start_service(service_name))
+            restart_events.append(start_service(service_name))
         self.record = RestorationRecord(
             candidate_pid=self._candidate_pid,
             candidate_pgid=self._candidate_pgid,

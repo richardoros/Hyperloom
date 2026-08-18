@@ -37,7 +37,7 @@ class ServiceEvent:
     returncode: Optional[int]
 
 
-def _systemctl(*args: list[str], timeout: float = 60.0) -> tuple[int, str]:
+def _systemctl(*args: str, timeout: float = 60.0) -> tuple[int, str]:
     try:
         out = subprocess.run(
             ["systemctl", *args],
