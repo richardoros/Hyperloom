@@ -1,0 +1,65 @@
+{
+  "pre_state": "{\n  \"captured_utc\": \"2026-08-18T23:23:38Z\",\n  \"lab_gpu\": {\n    \"uuid\": \"0x26592ee0cc915973\",\n    \"bdf\": \"0000:C8:00.0\",\n    \"gfx_arch\": \"gfx1100\",\n    \"board_name\": \"AMD Radeon RX 7900 XTX\",\n    \"vendor\": \"Advanced Micro Devices, Inc. [AMD/ATI]\"\n  },\n  \"gpu_processes\": [\n    {\n      \"pid\": 29926,\n      \"device_index\": 0,\n      \"gpu_uuid\": \"0x26592ee0cc915973\",\n      \"cmdline_short\": \"/home/homelabserver/src/llama.cpp/build/bin/llama-server -m /home/homelabserver/models/nomic-embed-text-Q8_0.gguf --embe\"\n    },\n    {\n      \"pid\": 29927,\n      \"device_index\": 0,\n      \"gpu_uuid\": \"0x26592ee0cc915973\",\n      \"cmdline_short\": \"/home/homelabserver/src/llama.cpp/build/bin/llama-server -m /home/homelabserver/models/Qwen3-Embedding-0.6B-Q8_0.gguf --\"\n    }\n  ],\n  \"gpu_telemetry\": {\n    \"vram_total_bytes\": 25753026560,\n    \"vram_used_bytes\": 154071040,\n    \"vram_free_bytes\": 25598955520,\n    \"temperature_c\": 45.0,\n    \"sclk_mhz\": null,\n    \"mclk_mhz\": null,\n    \"utilization_pct\": null\n  },\n  \"services\": [\n    {\n      \"name\": \"qwen38-turboquant.service\",\n      \"is_active\": \"unknown\",\n      \"is_enabled\": true\n    }\n  ],\n  \"listeners\": [\n    {\n      \"port\": 18079,\n      \"listening\": false,\n      \"process\": null\n    },\n    {\n      \"port\": 18179,\n      \"listening\": false,\n      \"process\": null\n    }\n  ],\n  \"production_health_ok\": false\n}",
+  "owners_stopped": [],
+  "exclusive_gate": {
+    "lab_gpu_uuid": "0x26592ee0cc915973",
+    "lab_gpu_bdf": "0000:C8:00.0",
+    "foreign_owners": [],
+    "services_stopped": [],
+    "timed_out": false,
+    "candidate_pgid": 25857,
+    "post_state_restored": true
+  },
+  "experiment_id": 2,
+  "candidate_pid": 25857,
+  "candidate_exit": 1,
+  "restoration": "{\n  \"candidate_pid\": 25857,\n  \"candidate_pgid\": 25857,\n  \"candidate_killed\": true,\n  \"services_restarted\": [],\n  \"restored_at_utc\": \"2026-08-18T23:24:13Z\",\n  \"post_state_restored\": true\n}",
+  "post_state": {
+    "services": [
+      {
+        "name": "qwen38-turboquant.service",
+        "is_active": "unknown",
+        "is_enabled": true
+      }
+    ],
+    "listeners": [
+      {
+        "port": 18079,
+        "listening": false,
+        "process": null
+      },
+      {
+        "port": 18179,
+        "listening": false,
+        "process": null
+      }
+    ],
+    "production_health_ok": false,
+    "gpu_telemetry": {
+      "vram_total_bytes": 25753026560,
+      "vram_used_bytes": 154071040,
+      "vram_free_bytes": 25598955520,
+      "temperature_c": 47.0,
+      "sclk_mhz": null,
+      "mclk_mhz": null,
+      "utilization_pct": null
+    },
+    "foreign_owners": [
+      {
+        "pid": 29926,
+        "gpu_uuid": "0x26592ee0cc915973",
+        "backend": "rocm",
+        "detail": "device_index=0 bdf=0000:c8:00.0"
+      },
+      {
+        "pid": 29927,
+        "gpu_uuid": "0x26592ee0cc915973",
+        "backend": "rocm",
+        "detail": "device_index=0 bdf=0000:c8:00.0"
+      }
+    ],
+    "captured_utc": "2026-08-18T23:24:14Z"
+  },
+  "outcome": "FAIL",
+  "captured_utc": "2026-08-18T23:24:14Z"
+}

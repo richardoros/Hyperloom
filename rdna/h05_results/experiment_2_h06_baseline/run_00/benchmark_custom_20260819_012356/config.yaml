@@ -1,0 +1,15 @@
+benchmark:
+  framework: custom
+  model: /home/homelabserver/models/Qwen3.8-27B-UD-Q5_K_XL.gguf
+  runner_type: rx7900xtx
+  precision: q5_k_xl
+  profiler:
+    torch_profiler:
+      enabled: false
+    system_profiler:
+      enabled: false
+    tracelens:
+      enabled: false
+  envs:
+    PORT: '18180'
+  timeout_seconds: 900

@@ -1,0 +1,14 @@
+success: False
+framework: custom
+model: /home/homelabserver/models/Qwen3.8-27B-UD-Q5_K_XL.gguf
+profiling_enabled: False
+execution_time_s: 17.222684621810913
+output_throughput: 0.0
+request_throughput: 0.0
+total_token_throughput: 0.0
+completed_requests: 0
+duration_seconds: 0.0
+mean_ttft_ms: 0.0
+mean_tpot_ms: 0.0
+errors:
+  - scriptable benchmark exited 1

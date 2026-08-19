@@ -1,0 +1,56 @@
+{
+  "success": false,
+  "framework": "custom",
+  "model": "/home/homelabserver/models/Qwen3.8-27B-UD-Q5_K_XL.gguf",
+  "throughput": {
+    "request_throughput": 0.0,
+    "output_throughput": 0.0,
+    "total_token_throughput": 0.0,
+    "completed_requests": 0,
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "duration_seconds": 0.0
+  },
+  "latency": {
+    "ttft": {
+      "mean_ms": 0.0,
+      "median_ms": 0.0,
+      "p99_ms": 0.0,
+      "std_ms": 0.0
+    },
+    "tpot": {
+      "mean_ms": 0.0,
+      "median_ms": 0.0,
+      "p99_ms": 0.0,
+      "std_ms": 0.0
+    },
+    "itl": {
+      "mean_ms": 0.0,
+      "median_ms": 0.0,
+      "p99_ms": 0.0,
+      "std_ms": 0.0
+    },
+    "e2el": {
+      "mean_ms": 0.0,
+      "median_ms": 0.0,
+      "p99_ms": 0.0,
+      "std_ms": 0.0
+    }
+  },
+  "kernel_summary": [],
+  "top_bottlenecks": [],
+  "tracelens_analysis": null,
+  "gap_analysis": null,
+  "gpu_monitor": null,
+  "workspace_dir": "/home/homelabserver/hyperloom-rdna/rdna/h05_results/experiment_3_h06_baseline/run_00/benchmark_custom_20260819_012642",
+  "execution_time": 25.770668745040894,
+  "errors": [
+    "scriptable benchmark exited 1"
+  ],
+  "profiling_enabled": false,
+  "workload_kind": "scriptable",
+  "throughput_unit": "tok/s",
+  "quality_gate": {
+    "passed": false
+  }
+}

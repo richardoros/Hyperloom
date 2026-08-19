@@ -1,0 +1,13 @@
+{
+  "framework": "custom",
+  "model_id": "/home/homelabserver/models/Qwen3.8-27B-UD-Q5_K_XL.gguf",
+  "workload_kind": "scriptable",
+  "throughput_unit": "tok/s",
+  "success": false,
+  "quality_gate": {
+    "passed": false
+  },
+  "errors": [
+    "bench subcommand failed"
+  ]
+}
